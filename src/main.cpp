@@ -4432,6 +4432,10 @@ private:
     void draw_splash(int cols, int rows) {
         std::ostringstream out;
 
+        // Sizing - wider box for epic look
+        const int box_width = std::min(84, cols - 4);
+        const int start_col = std::max(1, (cols - box_width) / 2);
+
         // Calculate sync metrics
         uint64_t network_height = sync_network_height_ > 0 ? sync_network_height_ : ibd_target_;
         uint64_t current_height = ibd_cur_;
@@ -4443,321 +4447,342 @@ private:
         // Peer info
         size_t peer_count = p2p_ ? p2p_->snapshot_peers().size() : 0;
 
-        // Check sync status
+        std::vector<std::string> lines;
+
+        // ===== CYBER BORDER TOP =====
+        if (vt_ok_ && u8_ok_) {
+            std::string border;
+            border += "\x1b[38;5;27m╔";
+            for (int i = 0; i < box_width - 2; ++i) {
+                int pulse = (tick_ + i) % 12;
+                if (pulse < 3) border += "\x1b[38;5;33m";
+                else if (pulse < 6) border += "\x1b[38;5;39m";
+                else if (pulse < 9) border += "\x1b[38;5;45m";
+                else border += "\x1b[38;5;51m";
+                border += "═";
+            }
+            border += "\x1b[38;5;27m╗\x1b[0m";
+            lines.push_back(border);
+        } else if (vt_ok_) {
+            // ANSI colors but ASCII characters
+            std::string border;
+            border += "\x1b[36m+";
+            for (int i = 0; i < box_width - 2; ++i) {
+                int pulse = (tick_ + i) % 4;
+                if (pulse < 2) border += "\x1b[36m";
+                else border += "\x1b[96m";
+                border += "=";
+            }
+            border += "\x1b[36m+\x1b[0m";
+            lines.push_back(border);
+        } else {
+            // Pure ASCII
+            lines.push_back("+" + std::string(box_width - 2, '=') + "+");
+        }
+
+        // ===== EPIC ASCII ART LOGO =====
+        if (u8_ok_ && box_width >= 70) {
+            lines.push_back("");
+            if (vt_ok_) {
+                // Animated gradient logo - cycles through electric colors
+                int color_offset = tick_ % 6;
+                static const int logo_colors[] = {51, 45, 39, 33, 27, 21};
+
+                auto logo_line = [&](const char* text) {
+                    std::string ln = "\x1b[38;5;" + std::to_string(logo_colors[color_offset]) + "m\x1b[1m";
+                    ln += text;
+                    ln += "\x1b[0m";
+                    return ln;
+                };
+
+                // BIGGER, more impressive ASCII art
+                lines.push_back(logo_line("    ███╗   ███╗██╗ ██████╗ ██████╗  ██████╗  ██████╗██╗  ██╗ █████╗ ██╗███╗   ██╗"));
+                lines.push_back(logo_line("    ████╗ ████║██║██╔═══██╗██╔══██╗██╔═══██╗██╔════╝██║  ██║██╔══██╗██║████╗  ██║"));
+                lines.push_back(logo_line("    ██╔████╔██║██║██║   ██║██████╔╝██║   ██║██║     ███████║███████║██║██╔██╗ ██║"));
+                lines.push_back(logo_line("    ██║╚██╔╝██║██║██║▄▄ ██║██╔══██╗██║   ██║██║     ██╔══██║██╔══██║██║██║╚██╗██║"));
+                lines.push_back(logo_line("    ██║ ╚═╝ ██║██║╚██████╔╝██║  ██║╚██████╔╝╚██████╗██║  ██║██║  ██║██║██║ ╚████║"));
+                lines.push_back(logo_line("    ╚═╝     ╚═╝╚═╝ ╚══▀▀═╝ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝"));
+            } else {
+                lines.push_back("  MIQROCHAIN NODE");
+            }
+        } else if (box_width >= 60) {
+            // ASCII-safe logo for PowerShell 5 and other legacy terminals
+            lines.push_back("");
+            if (vt_ok_) {
+                int color_offset = tick_ % 6;
+                static const int logo_colors[] = {36, 96, 32, 92, 34, 94};  // Cycling ANSI colors
+                std::string col = "\x1b[" + std::to_string(logo_colors[color_offset]) + "m\x1b[1m";
+                std::string rst = "\x1b[0m";
+                lines.push_back(col + "    M   M  III   QQQ   RRRR    OOO    CCCC  H   H   AAA   III  N   N" + rst);
+                lines.push_back(col + "    MM MM   I   Q   Q  R   R  O   O  C      H   H  A   A   I   NN  N" + rst);
+                lines.push_back(col + "    M M M   I   Q   Q  RRRR   O   O  C      HHHHH  AAAAA   I   N N N" + rst);
+                lines.push_back(col + "    M   M   I   Q  QQ  R  R   O   O  C      H   H  A   A   I   N  NN" + rst);
+                lines.push_back(col + "    M   M  III   QQQQ  R   R   OOO    CCCC  H   H  A   A  III  N   N" + rst);
+            } else {
+                lines.push_back("    M   M  III   QQQ   RRRR    OOO    CCCC  H   H   AAA   III  N   N");
+                lines.push_back("    MM MM   I   Q   Q  R   R  O   O  C      H   H  A   A   I   NN  N");
+                lines.push_back("    M M M   I   Q   Q  RRRR   O   O  C      HHHHH  AAAAA   I   N N N");
+                lines.push_back("    M   M   I   Q  QQ  R  R   O   O  C      H   H  A   A   I   N  NN");
+                lines.push_back("    M   M  III   QQQQ  R   R   OOO    CCCC  H   H  A   A  III  N   N");
+            }
+        } else {
+            lines.push_back("");
+            lines.push_back(glow_text("MIQROCHAIN", tick_, vt_ok_));
+        }
+
+        // ===== TAGLINE WITH BLOCKCHAIN ANIMATION =====
+        lines.push_back("");
+        if (vt_ok_) {
+            std::string tagline = "\x1b[38;5;240m" + std::string(u8_ok_ ? "━━━━━━━━━━━━━" : "-------------") + "\x1b[0m  ";
+            tagline += blockchain_anim(tick_, u8_ok_, vt_ok_);
+            tagline += "  \x1b[38;5;240m" + std::string(u8_ok_ ? "━━━━━━━━━━━━━" : "-------------") + "\x1b[0m";
+            lines.push_back(center_text(tagline, box_width));
+        }
+
+        // ===== VERSION & NETWORK INFO =====
+        std::ostringstream ver;
+        if (vt_ok_) {
+            std::string sep = u8_ok_ ? "│" : "|";
+            ver << "\x1b[38;5;243mv" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH
+                << "\x1b[0m  \x1b[38;5;240m" << sep << "\x1b[0m  \x1b[38;5;75m" << CHAIN_NAME << "\x1b[0m"
+                << "  \x1b[38;5;240m" << sep << "\x1b[0m  " << network_pulse(tick_, (int)peer_count, u8_ok_, vt_ok_);
+        } else {
+            ver << "v" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH
+                << " | " << CHAIN_NAME << " | " << peer_count << " peers";
+        }
+        lines.push_back(center_text(ver.str(), box_width));
+        lines.push_back("");
+
+        // ===== SYNC STATUS HEADER WITH EFFECTS =====
+        // IMPORTANT: Only show as complete if we have network data AND are actually synced
         bool has_network_data = network_height > 0;
         bool actually_complete = has_network_data && sync_progress >= 99.9;
 
-        std::vector<std::string> lines;
-
-        // ===== TITLE: MIQROCHAIN =====
-        lines.push_back("");
-        if (vt_ok_) {
-            // Animated cyan title
-            static const int title_colors[] = {51, 50, 49, 48, 47, 46, 45, 44, 43, 42};
-            int tc = title_colors[tick_ % 10];
-            lines.push_back("\x1b[38;5;" + std::to_string(tc) + "m\x1b[1mMIQROCHAIN\x1b[0m");
-        } else {
-            lines.push_back("MIQROCHAIN");
-        }
-
-        // ===== VERSION LINE =====
-        std::ostringstream ver;
-        if (vt_ok_) {
-            ver << "\x1b[38;5;248mv" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH
-                << "\x1b[0m  \x1b[38;5;240m|\x1b[0m  \x1b[38;5;248m" << CHAIN_NAME << "\x1b[0m";
-        } else {
-            ver << "v" << MIQ_VERSION_MAJOR << "." << MIQ_VERSION_MINOR << "." << MIQ_VERSION_PATCH
-                << "  |  " << CHAIN_NAME;
-        }
-        lines.push_back(ver.str());
-        lines.push_back("");
-
-        // ===== SYNC STATUS LINE =====
-        std::ostringstream sync_line;
+        std::ostringstream header;
         if (actually_complete) {
+            // EPIC completion animation - only when TRULY complete
             if (vt_ok_) {
-                sync_line << "\x1b[38;5;240m|\x1b[0m \x1b[38;5;46m\x1b[1mBlockchain Synchronized\x1b[0m  ";
-                sync_line << "\x1b[38;5;240m[\x1b[38;5;46m###\x1b[38;5;240m]\x1b[0m";
+                static const int celebrate_colors[] = {46, 226, 208, 201, 51, 46};
+                int c = celebrate_colors[tick_ % 6];
+                header << "\x1b[38;5;" << c << "m\x1b[1m";
+                header << (u8_ok_ ? "★ ✓ " : "[*] ");
+                header << "BLOCKCHAIN SYNCHRONIZED";
+                header << (u8_ok_ ? " ✓ ★" : " [*]");
+                header << "\x1b[0m";
             } else {
-                sync_line << "| Blockchain Synchronized  [###]";
+                header << "[OK] BLOCKCHAIN SYNCHRONIZED";
             }
         } else if (!has_network_data) {
+            // No network data yet - show initializing state
             if (vt_ok_) {
-                sync_line << "\x1b[38;5;240m|\x1b[0m \x1b[38;5;255mConnecting to Network\x1b[0m  ";
-                sync_line << "\x1b[38;5;240m[" << splash_spinner(tick_, u8_ok_) << "\x1b[38;5;240m]\x1b[0m";
+                header << "\x1b[38;5;214m" << splash_spinner(tick_, u8_ok_) << " \x1b[0m";
+                header << "\x1b[38;5;255m\x1b[1mCONNECTING TO NETWORK\x1b[0m";
             } else {
-                sync_line << "| Connecting to Network  " << splash_spinner(tick_, u8_ok_);
+                header << splash_spinner(tick_, u8_ok_) << " CONNECTING TO NETWORK";
             }
         } else {
+            // Syncing in progress
             if (vt_ok_) {
-                sync_line << "\x1b[38;5;240m|\x1b[0m \x1b[38;5;255mSynchronizing Blockchain\x1b[0m  ";
-                sync_line << "\x1b[38;5;240m[" << splash_spinner(tick_, u8_ok_) << "\x1b[38;5;240m]\x1b[0m";
+                header << "\x1b[38;5;214m" << splash_spinner(tick_, u8_ok_) << " \x1b[0m";
+                header << "\x1b[38;5;255m\x1b[1mSYNCHRONIZING BLOCKCHAIN\x1b[0m";
             } else {
-                sync_line << "| Synchronizing Blockchain  " << splash_spinner(tick_, u8_ok_);
+                header << splash_spinner(tick_, u8_ok_) << " SYNCHRONIZING BLOCKCHAIN";
             }
         }
-        lines.push_back(sync_line.str());
+        lines.push_back(center_text(header.str(), box_width));
         lines.push_back("");
 
-        // ===== SIMPLE PROGRESS BAR =====
-        const int bar_width = 72;
-        std::string progress_bar;
-        int inner = bar_width - 2;
-        int filled = (int)(frac * inner);
+        // ===== MEGA PROGRESS BAR =====
+        int bar_width = box_width - 8;
+        lines.push_back("    " + splash_progress_bar(bar_width, frac, tick_));
 
-        if (vt_ok_ && u8_ok_) {
-            progress_bar += "\x1b[38;5;240m▐\x1b[0m";
-            for (int i = 0; i < inner; ++i) {
-                if (i < filled) {
-                    progress_bar += "\x1b[38;5;46m█\x1b[0m";
-                } else if (i == filled && frac < 1.0) {
-                    static const char* edge[] = {"░", "▒", "▓", "▒"};
-                    progress_bar += "\x1b[38;5;46m";
-                    progress_bar += edge[tick_ % 4];
-                    progress_bar += "\x1b[0m";
-                } else {
-                    progress_bar += "\x1b[38;5;236m░\x1b[0m";
-                }
-            }
-            progress_bar += "\x1b[38;5;240m▌\x1b[0m";
-        } else if (vt_ok_) {
-            progress_bar += "\x1b[36m[\x1b[0m";
-            for (int i = 0; i < inner; ++i) {
-                if (i < filled) {
-                    progress_bar += "\x1b[32m#\x1b[0m";
-                } else if (i == filled && frac < 1.0) {
-                    progress_bar += "\x1b[33m>\x1b[0m";
-                } else {
-                    progress_bar += "\x1b[90m-\x1b[0m";
-                }
-            }
-            progress_bar += "\x1b[36m]\x1b[0m";
-        } else {
-            progress_bar += "[";
-            for (int i = 0; i < inner; ++i) {
-                if (i < filled) progress_bar += "#";
-                else if (i == filled && frac < 1.0) progress_bar += ">";
-                else progress_bar += "-";
-            }
-            progress_bar += "]";
-        }
-        lines.push_back(progress_bar);
-
-        // ===== PERCENTAGE =====
-        std::ostringstream pct;
-        pct << std::fixed << std::setprecision(2) << sync_progress << "%";
-        if (vt_ok_) {
-            int pct_color = actually_complete ? 46 : 46;  // Green
-            lines.push_back("\x1b[38;5;" + std::to_string(pct_color) + "m" + pct.str() + "\x1b[0m");
-        } else {
-            lines.push_back(pct.str());
-        }
+        // ===== EPIC PERCENTAGE DISPLAY =====
+        lines.push_back(center_text(big_percentage(sync_progress, tick_), box_width));
         lines.push_back("");
 
-        // ===== STATS BOX =====
-        const int panel_width = 72;
-        std::string hbar = std::string(panel_width - 2, '-');
-        std::string panel_top = "+" + hbar + "+";
-        std::string panel_bot = "+" + hbar + "+";
+        // ===== PREMIUM STATS PANEL =====
+        std::string panel_top = u8_ok_ ? "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
+                                       : "+--------------------------------------------------------------+";
+        std::string panel_bot = u8_ok_ ? "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
+                                       : "+--------------------------------------------------------------+";
+        std::string vbar = u8_ok_ ? "┃" : "|";
+        int panel_inner = 62;
 
-        if (vt_ok_) lines.push_back("\x1b[38;5;240m" + panel_top + "\x1b[0m");
-        else lines.push_back(panel_top);
+        if (vt_ok_) lines.push_back("    \x1b[38;5;240m" + panel_top + "\x1b[0m");
+        else lines.push_back("    " + panel_top);
 
-        // Row 1: Blocks
+        // Row 1: Block Progress with mini-visualization
         {
             std::ostringstream row;
-            row << "| ";
+            row << vbar << " ";
             if (vt_ok_) {
-                row << "\x1b[38;5;248mBlocks\x1b[0m";
+                row << "\x1b[38;5;75m" << (u8_ok_ ? "◆ " : "> ") << "\x1b[38;5;248mBlocks\x1b[0m     ";
+                row << "\x1b[38;5;87m" << std::setw(12) << fmt_num(current_height) << "\x1b[0m";
+                row << "\x1b[38;5;240m / \x1b[0m";
+                row << "\x1b[38;5;255m" << std::setw(12) << fmt_num(network_height) << "\x1b[0m";
             } else {
-                row << "Blocks";
-            }
-            // Padding to align values
-            row << std::string(14 - 6, ' ');
-            if (vt_ok_) {
-                row << "\x1b[38;5;208m" << fmt_num(current_height) << "\x1b[0m";
-                row << " \x1b[38;5;240m/\x1b[0m ";
-                row << "\x1b[38;5;255m" << fmt_num(network_height) << "\x1b[0m";
-            } else {
-                row << fmt_num(current_height) << " / " << fmt_num(network_height);
+                row << "> Blocks       " << std::setw(12) << fmt_num(current_height);
+                row << " / " << std::setw(12) << fmt_num(network_height);
             }
             std::string r = row.str();
-            // Calculate visible length for padding
-            int vis = 14 + (int)fmt_num(current_height).size() + 3 + (int)fmt_num(network_height).size() + 2;
-            int pad = panel_width - vis - 1;
-            if (pad > 0) r += std::string(pad, ' ');
-            r += "|";
-            if (vt_ok_) lines.push_back("\x1b[38;5;240m" + r + "\x1b[0m");
-            else lines.push_back(r);
+            int vis_len = 45;
+            r += std::string(panel_inner - vis_len, ' ') + vbar;
+            lines.push_back(std::string("    ") + (vt_ok_ ? "\x1b[38;5;240m" : "") + r + (vt_ok_ ? "\x1b[0m" : ""));
         }
 
         // Row 2: Remaining
         {
             std::ostringstream row;
-            row << "| ";
+            row << vbar << " ";
             if (vt_ok_) {
-                row << "\x1b[38;5;248mRemaining\x1b[0m";
+                row << "\x1b[38;5;214m" << (u8_ok_ ? "◇ " : "> ") << "\x1b[38;5;248mRemaining\x1b[0m  ";
+                row << "\x1b[38;5;214m" << std::setw(12) << fmt_num(blocks_remaining) << "\x1b[0m";
+                row << " blocks";
             } else {
-                row << "Remaining";
-            }
-            row << std::string(14 - 9, ' ');
-            if (vt_ok_) {
-                row << "\x1b[38;5;214m" << fmt_num(blocks_remaining) << "\x1b[0m blocks";
-            } else {
-                row << fmt_num(blocks_remaining) << " blocks";
+                row << "> Remaining    " << std::setw(12) << fmt_num(blocks_remaining) << " blocks";
             }
             std::string r = row.str();
-            int vis = 14 + (int)fmt_num(blocks_remaining).size() + 9;
-            int pad = panel_width - vis - 1;
-            if (pad > 0) r += std::string(pad, ' ');
-            r += "|";
-            if (vt_ok_) lines.push_back("\x1b[38;5;240m" + r + "\x1b[0m");
-            else lines.push_back(r);
+            int vis_len = 38;
+            r += std::string(panel_inner - vis_len, ' ') + vbar;
+            lines.push_back(std::string("    ") + (vt_ok_ ? "\x1b[38;5;240m" : "") + r + (vt_ok_ ? "\x1b[0m" : ""));
         }
 
-        // Row 3: ETA
+        // Row 3: Speed with trend indicator
         {
-            std::string eta_str;
-            if (actually_complete) {
-                eta_str = "Complete";
-            } else if (!has_network_data) {
-                eta_str = "Awaiting peers...";
-            } else if (sync_blocks_per_sec_ > 0.01 && blocks_remaining > 0) {
-                eta_str = fmt_eta(blocks_remaining, sync_blocks_per_sec_);
-            } else {
-                eta_str = "Calculating...";
-            }
-
             std::ostringstream row;
-            row << "| ";
+            row << vbar << " ";
             if (vt_ok_) {
-                row << "\x1b[38;5;248mETA\x1b[0m";
-            } else {
-                row << "ETA";
-            }
-            row << std::string(14 - 3, ' ');
-            if (vt_ok_) {
-                int eta_color = actually_complete ? 46 : 226;  // Green if complete, yellow otherwise
-                row << "\x1b[38;5;" << eta_color << "m" << eta_str << "\x1b[0m";
-            } else {
-                row << eta_str;
-            }
-            std::string r = row.str();
-            int vis = 14 + (int)eta_str.size() + 2;
-            int pad = panel_width - vis - 1;
-            if (pad > 0) r += std::string(pad, ' ');
-            r += "|";
-            if (vt_ok_) lines.push_back("\x1b[38;5;240m" + r + "\x1b[0m");
-            else lines.push_back(r);
-        }
-
-        // Row 4: Speed
-        {
-            std::string speed_str;
-            if (sync_blocks_per_sec_ > 0.01) {
-                std::ostringstream ss;
-                ss << std::fixed << std::setprecision(1) << sync_blocks_per_sec_ << " blk/s";
-                speed_str = ss.str();
-            } else {
-                speed_str = "measuring...";
-            }
-
-            std::ostringstream row;
-            row << "| ";
-            if (vt_ok_) {
-                row << "\x1b[38;5;248mSpeed\x1b[0m";
-            } else {
-                row << "Speed";
-            }
-            row << std::string(14 - 5, ' ');
-            if (vt_ok_) {
+                row << "\x1b[38;5;46m" << (u8_ok_ ? "◈ " : "> ") << "\x1b[38;5;248mSpeed\x1b[0m      ";
                 if (sync_blocks_per_sec_ > 0.01) {
-                    row << "\x1b[38;5;46m" << speed_str << "\x1b[0m";
+                    row << "\x1b[38;5;46m" << std::fixed << std::setprecision(1) << sync_blocks_per_sec_ << "\x1b[0m blk/s";
+                    // Trend indicator
+                    row << "  " << (u8_ok_ ? "↑" : "^");
                 } else {
-                    row << "\x1b[38;5;240m" << speed_str << "\x1b[0m";
+                    row << "\x1b[38;5;240m" << (u8_ok_ ? "◌ measuring..." : "measuring...") << "\x1b[0m";
                 }
             } else {
-                row << speed_str;
+                row << "> Speed        ";
+                if (sync_blocks_per_sec_ > 0.01) {
+                    row << std::fixed << std::setprecision(1) << sync_blocks_per_sec_ << " blk/s";
+                } else {
+                    row << "measuring...";
+                }
             }
             std::string r = row.str();
-            int vis = 14 + (int)speed_str.size() + 2;
-            int pad = panel_width - vis - 1;
-            if (pad > 0) r += std::string(pad, ' ');
-            r += "|";
-            if (vt_ok_) lines.push_back("\x1b[38;5;240m" + r + "\x1b[0m");
-            else lines.push_back(r);
+            int vis_len = 40;
+            r += std::string(panel_inner - vis_len, ' ') + vbar;
+            lines.push_back(std::string("    ") + (vt_ok_ ? "\x1b[38;5;240m" : "") + r + (vt_ok_ ? "\x1b[0m" : ""));
         }
 
-        if (vt_ok_) lines.push_back("\x1b[38;5;240m" + panel_bot + "\x1b[0m");
-        else lines.push_back(panel_bot);
+        // Row 4: ETA
+        {
+            std::string eta_str = "Calculating...";
+            // Only show complete if we ACTUALLY have data and are synced
+            if (actually_complete) {
+                eta_str = u8_ok_ ? "✓ Complete" : "Complete";
+            } else if (!has_network_data) {
+                eta_str = u8_ok_ ? "◌ Awaiting peers..." : "Awaiting peers...";
+            } else if (sync_blocks_per_sec_ > 0.01 && blocks_remaining > 0) {
+                eta_str = fmt_eta(blocks_remaining, sync_blocks_per_sec_);
+            }
+
+            std::ostringstream row;
+            row << vbar << " ";
+            if (vt_ok_) {
+                row << "\x1b[38;5;226m" << (u8_ok_ ? "◉ " : "> ") << "\x1b[38;5;248mETA\x1b[0m        ";
+                row << "\x1b[38;5;226m" << eta_str << "\x1b[0m";
+            } else {
+                row << "> ETA          " << eta_str;
+            }
+            std::string r = row.str();
+            int vis_len = 16 + (int)eta_str.size();
+            r += std::string(std::max(1, panel_inner - vis_len), ' ') + vbar;
+            lines.push_back(std::string("    ") + (vt_ok_ ? "\x1b[38;5;240m" : "") + r + (vt_ok_ ? "\x1b[0m" : ""));
+        }
+
+        if (vt_ok_) lines.push_back("    \x1b[38;5;240m" + panel_bot + "\x1b[0m");
+        else lines.push_back("    " + panel_bot);
 
         lines.push_back("");
 
         // ===== STATUS LINE =====
         std::ostringstream status;
-        status << "Status: ";
-        if (actually_complete) {
-            if (vt_ok_) {
-                status << "\x1b[38;5;46m\x1b[1mFULLY SYNCED\x1b[0m";
-            } else {
-                status << "FULLY SYNCED";
-            }
-        } else if (!has_network_data) {
-            if (vt_ok_) {
-                status << "\x1b[38;5;214mconnecting...\x1b[0m";
-            } else {
-                status << "connecting...";
-            }
-        } else {
-            if (vt_ok_) {
-                status << "\x1b[38;5;214msyncing\x1b[0m";
-            } else {
-                status << "syncing";
-            }
-        }
-        lines.push_back(status.str());
+        status << C_dim() << (u8_ok_ ? "⚡ " : "> ") << "Status: " << C_reset() << get_sync_status(blocks_remaining, sync_progress, network_height);
+        lines.push_back(center_text(status.str(), box_width));
 
-        // ===== NETWORK LINE =====
+        // ===== NETWORK INFO =====
         std::ostringstream net;
-        net << "Network: ";
+        net << C_dim() << (u8_ok_ ? "🌐 " : "@ ") << "Network: " << C_reset();
         if (peer_count == 0) {
-            if (vt_ok_) {
-                static const char* conn_anim[] = {"connecting", "connecting.", "connecting..", "connecting..."};
-                net << "\x1b[38;5;214m" << conn_anim[tick_ % 4] << "\x1b[0m";
-            } else {
-                net << "connecting...";
-            }
+            static const char* conn_anim[] = {"scanning", "scanning.", "scanning..", "scanning..."};
+            if (vt_ok_) net << "\x1b[38;5;208m" << conn_anim[tick_ % 4] << "\x1b[0m";
+            else net << conn_anim[tick_ % 4];
         } else {
-            if (vt_ok_) {
-                net << "\x1b[38;5;46m" << peer_count << " peer" << (peer_count != 1 ? "s" : "") << " connected\x1b[0m";
-            } else {
-                net << peer_count << " peers connected";
+            if (vt_ok_) net << "\x1b[38;5;46m" << peer_count << " peer" << (peer_count != 1 ? "s" : "") << " active\x1b[0m";
+            else net << peer_count << " peers active";
+            if (!ibd_seed_host_.empty()) {
+                net << C_dim() << " via " << C_reset();
+                if (vt_ok_) net << "\x1b[38;5;75m" << ibd_seed_host_ << "\x1b[0m";
+                else net << ibd_seed_host_;
             }
         }
-        lines.push_back(net.str());
+        lines.push_back(center_text(net.str(), box_width));
+        lines.push_back("");
+
+        // ===== CYBER BORDER BOTTOM =====
+        if (vt_ok_ && u8_ok_) {
+            std::string border;
+            border += "\x1b[38;5;27m╚";
+            for (int i = 0; i < box_width - 2; ++i) {
+                int pulse = (tick_ + i) % 12;
+                if (pulse < 3) border += "\x1b[38;5;33m";
+                else if (pulse < 6) border += "\x1b[38;5;39m";
+                else if (pulse < 9) border += "\x1b[38;5;45m";
+                else border += "\x1b[38;5;51m";
+                border += "═";
+            }
+            border += "\x1b[38;5;27m╝\x1b[0m";
+            lines.push_back(border);
+        } else if (vt_ok_) {
+            // ANSI colors but ASCII characters
+            std::string border;
+            border += "\x1b[36m+";
+            for (int i = 0; i < box_width - 2; ++i) {
+                int pulse = (tick_ + i) % 4;
+                if (pulse < 2) border += "\x1b[36m";
+                else border += "\x1b[96m";
+                border += "=";
+            }
+            border += "\x1b[36m+\x1b[0m";
+            lines.push_back(border);
+        } else {
+            // Pure ASCII
+            lines.push_back("+" + std::string(box_width - 2, '=') + "+");
+        }
         lines.push_back("");
 
         // ===== FOOTER =====
+        std::ostringstream foot1;
         if (vt_ok_) {
-            lines.push_back("\x1b[38;5;240m> Main dashboard opens automatically when sync completes\x1b[0m");
-            lines.push_back("\x1b[38;5;240m[q] quit  [t] theme  [v] verbose\x1b[0m");
+            foot1 << "\x1b[38;5;240m" << (u8_ok_ ? "⚡ " : "> ");
+            foot1 << "Dashboard opens automatically when sync completes\x1b[0m";
         } else {
-            lines.push_back("> Main dashboard opens automatically when sync completes");
-            lines.push_back("[q] quit  [t] theme  [v] verbose");
+            foot1 << "> Dashboard opens automatically when sync completes";
         }
+        lines.push_back(center_text(foot1.str(), box_width));
+
+        std::ostringstream foot2;
+        if (vt_ok_) {
+            foot2 << "\x1b[38;5;240m[q] quit  [t] theme  [v] verbose\x1b[0m";
+        } else {
+            foot2 << "[q] quit  [t] theme  [v] verbose";
+        }
+        lines.push_back(center_text(foot2.str(), box_width));
         lines.push_back("");
 
-        // ===== RENDER - CENTER EVERYTHING =====
-        // Calculate max visible width for centering
-        int max_vis_width = 0;
-        for (const auto& line : lines) {
-            int vis = visible_length(line);
-            if (vis > max_vis_width) max_vis_width = vis;
-        }
-
+        // ===== RENDER =====
         int content_height = (int)lines.size();
         int start_row = std::max(1, (rows - content_height) / 2);
-        (void)max_vis_width;  // Used for centering calculations above
 
         if (vt_ok_) {
             out << "\x1b[H\x1b[J";  // Clear screen
@@ -4766,12 +4791,10 @@ private:
         // Top padding
         for (int i = 0; i < start_row; ++i) out << "\n";
 
-        // Content - center each line
+        // Content
+        std::string padding(start_col, ' ');
         for (const auto& line : lines) {
-            int vis = visible_length(line);
-            int pad = (cols - vis) / 2;
-            if (pad > 0) out << std::string(pad, ' ');
-            out << line << "\n";
+            out << padding << line << "\n";
         }
 
         // Bottom padding
