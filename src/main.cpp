@@ -1067,39 +1067,27 @@ static inline std::string fmt_eta(uint64_t blocks_remaining, double blocks_per_s
     return o.str();
 }
 
-// Spinner & drawing helpers - IMPROVED with smoother animations
+// Spinner & drawing helpers - uses ASCII for consistent width
 static inline std::string spinner(int tick, bool fancy){
-    if (fancy){
-        // Braille spinner for Unicode terminals - smooth 10-frame animation
-        static const char* frames[] = {"⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"};
-        return frames[(size_t)(tick % 10)];
-    } else {
-        // ASCII spinner optimized for PowerShell 5+ - 8-frame animation for smoother look
-        static const char* frames[] = {"|", "/", "-", "\\", "|", "/", "-", "\\"};
-        return std::string(frames[(size_t)(tick & 7)]);
-    }
+    (void)fancy;  // Unused - always use ASCII for consistent width
+    // ASCII spinner - 4-frame animation
+    static const char* frames[] = {"|", "/", "-", "\\"};
+    return std::string(frames[(size_t)(tick % 4)]);
 }
 
-// Additional animated indicators for professional look
+// Additional animated indicators - uses ASCII for consistent width
 static inline std::string activity_indicator(int tick, bool active, bool fancy){
-    if (!active) return fancy ? "○" : "o";
-    if (fancy){
-        static const char* frames[] = {"◐","◓","◑","◒"};
-        return frames[(size_t)(tick % 4)];
-    } else {
-        static const char* frames[] = {"[*]","[+]","[*]","[x]"};
-        return frames[(size_t)(tick % 4)];
-    }
+    (void)fancy;  // Unused - always use ASCII for consistent width
+    if (!active) return "o";
+    static const char* frames[] = {"[*]","[+]","[*]","[x]"};
+    return frames[(size_t)(tick % 4)];
 }
 
+// Pulse indicator - uses ASCII for consistent width
 static inline std::string pulse_indicator(int tick, bool fancy){
-    if (fancy){
-        static const char* frames[] = {"▁","▂","▃","▄","▅","▆","▇","█","▇","▆","▅","▄","▃","▂"};
-        return frames[(size_t)(tick % 14)];
-    } else {
-        static const char* frames[] = {".", "o", "O", "0", "O", "o"};
-        return frames[(size_t)(tick % 6)];
-    }
+    (void)fancy;  // Unused - always use ASCII for consistent width
+    static const char* frames[] = {".", "o", "O", "0", "O", "o"};
+    return frames[(size_t)(tick % 6)];
 }
 static inline std::string straight_line(int w){
     if (w <= 0) return {};
@@ -1373,23 +1361,43 @@ static double estimate_network_hashrate(Chain* chain){
     return (double)hps;
 }
 
-// Sparklines
-static inline std::string spark_ascii(const std::vector<double>& v){
-    if (v.empty()) return std::string("-");
-    double mn = v.front(), mx = v.front();
-    for (double x : v){ if (x < mn) mn = x; if (x > mx) mx = x; }
+// Sparklines with fixed maximum width for consistent panel layout
+// max_chars: maximum number of sparkline characters to display (default 16)
+// Uses ASCII-only characters to ensure consistent width across all platforms
+static inline std::string spark_ascii(const std::vector<double>& v, size_t max_chars = 16){
+    if (v.empty()) return std::string(max_chars, '-');
+
+    // Only use the most recent max_chars data points
+    size_t start = (v.size() > max_chars) ? (v.size() - max_chars) : 0;
+    size_t count = std::min(v.size(), max_chars);
+
+    // Find min/max in the visible range
+    double mn = v[start], mx = v[start];
+    for (size_t i = start; i < start + count; ++i) {
+        if (v[i] < mn) mn = v[i];
+        if (v[i] > mx) mx = v[i];
+    }
     double span = (mx - mn);
-    bool fancy = env_truthy_local("MIQ_TUI_UTF8");
-    const char* blocks8 = "▁▂▃▄▅▆▇#"; // 8 glyphs, UTF-8 (3 bytes each)
-    const char* ascii   = " .:-=+*#%@";
-    std::string out; out.reserve(v.size());
-    for (double x : v){
+
+    // Always use ASCII characters for consistent width across all terminals
+    // This prevents layout issues with UTF-8 block elements that may display
+    // as double-width on Windows terminals
+    const char* ascii = " .:-=+*#%";
+    std::string out; out.reserve(max_chars);
+
+    // Pad with spaces if we have fewer data points than max_chars
+    size_t padding = max_chars - count;
+    for (size_t i = 0; i < padding; ++i) {
+        out += ' ';
+    }
+
+    // Generate sparkline for visible data
+    for (size_t i = start; i < start + count; ++i) {
         int idx = 0;
-        if (span > 0) idx = (int)std::floor((x - mn) / span * 7.999);
+        if (span > 0) idx = (int)std::floor((v[i] - mn) / span * 7.999);
         if (idx < 0) idx = 0;
-        if (idx > 7) idx = 7; // <- split lines to avoid -Wmisleading-indentation
-        out += fancy ? std::string(blocks8 + idx*3, 3)   // <- correct UTF-8 indexing
-                     : std::string(1, ascii[(size_t)idx]);
+        if (idx > 7) idx = 7;
+        out += ascii[idx];
     }
     return out;
 }
@@ -1963,22 +1971,17 @@ private:
     // SPLASH SCREEN - Professional sync display with animations
     // =========================================================================
 
-    // Animated spinner characters (multiple styles)
+    // Animated spinner characters - uses ASCII for consistent width
     static const char* splash_spinner(int tick, bool u8) {
-        if (u8) {
-            static const char* frames[] = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
-            return frames[tick % 10];
-        } else {
-            static const char* frames[] = {"|", "/", "-", "\\"};
-            return frames[tick % 4];
-        }
+        (void)u8;  // Unused - always use ASCII for consistency
+        static const char* frames[] = {"|", "/", "-", "\\"};
+        return frames[tick % 4];
     }
 
-    // Pulsing block animation for sync
+    // Pulsing block animation for sync - uses ASCII for consistent width
     static std::string pulse_blocks(int tick, bool u8, bool vt) {
-        if (!u8) return "[###]";
-        // Animated chain of blocks with wave effect
-        static const char* blocks[] = {"░", "▒", "▓", "█"};
+        (void)u8;  // Unused - always use ASCII for consistency
+        static const char blocks[] = {'.', ':', '#', '@'};
         std::string out;
         if (vt) out += "\x1b[36m";  // Cyan
         for (int i = 0; i < 5; ++i) {
@@ -2358,6 +2361,7 @@ private:
 
     // Get visible length of string (excluding ANSI escape codes)
     // FIXED: Properly handles UTF-8 multi-byte characters for accurate width calculation
+    // Also accounts for block elements that may render as double-width on some terminals
     static int visible_length(const std::string& s) {
         int len = 0;
         bool in_escape = false;
@@ -2373,6 +2377,54 @@ private:
                 if ((c & 0xC0) != 0x80) {
                     ++len;
                 }
+            }
+        }
+        return len;
+    }
+
+    // Calculate display width accounting for potentially wide block elements
+    // On Windows terminals with certain fonts, block chars may be double-width
+    static int display_width(const std::string& s) {
+        int len = 0;
+        bool in_escape = false;
+        for (size_t i = 0; i < s.size(); ) {
+            unsigned char c = static_cast<unsigned char>(s[i]);
+            if (c == '\x1b') {
+                in_escape = true;
+                ++i;
+            } else if (in_escape) {
+                if (c == 'm') in_escape = false;
+                ++i;
+            } else if ((c & 0x80) == 0) {
+                // ASCII character - single width
+                ++len;
+                ++i;
+            } else if ((c & 0xE0) == 0xC0 && i + 1 < s.size()) {
+                // 2-byte UTF-8
+                ++len;
+                i += 2;
+            } else if ((c & 0xF0) == 0xE0 && i + 2 < s.size()) {
+                // 3-byte UTF-8 - check for block elements (U+2580-U+259F, U+2500-U+257F box drawing)
+                unsigned char c2 = static_cast<unsigned char>(s[i + 1]);
+                unsigned char c3 = static_cast<unsigned char>(s[i + 2]);
+                // Decode UTF-8 to codepoint
+                uint32_t cp = ((c & 0x0F) << 12) | ((c2 & 0x3F) << 6) | (c3 & 0x3F);
+                // Block Elements (U+2580-U+259F) and shade characters may be wide on Windows
+                if (cp >= 0x2580 && cp <= 0x259F) {
+                    // Conservative: treat block elements as potentially wide
+                    // Add extra width only for animated/sparkline chars
+                    ++len;
+                } else {
+                    ++len;
+                }
+                i += 3;
+            } else if ((c & 0xF8) == 0xF0 && i + 3 < s.size()) {
+                // 4-byte UTF-8
+                ++len;
+                i += 4;
+            } else {
+                // Invalid or continuation byte, skip
+                ++i;
             }
         }
         return len;
@@ -2444,23 +2496,17 @@ private:
         return out.str();
     }
 
-    // Animated activity dot
+    // Animated activity dot - uses ASCII for consistent width
     std::string activity_dot(int tick, bool active) const {
-        if (!active) return u8_ok_ ? "○" : "o";
-        if (u8_ok_) {
-            static const char* frames[] = {"●", "◉", "○", "◉"};
-            return frames[tick % 4];
-        } else {
-            static const char* frames[] = {"*", "o", "*", "O"};
-            return frames[tick % 4];
-        }
+        if (!active) return "o";
+        static const char frames[] = {'*', 'o', '*', 'O'};
+        return std::string(1, frames[tick % 4]);
     }
 
-    // Wave animation for status bar
+    // Wave animation for status bar - uses ASCII for consistent width
     std::string wave_bar(int width, int tick) const {
-        if (!u8_ok_) return std::string(width, '~');
         std::string out;
-        static const char* waves[] = {"░", "▒", "▓", "█", "▓", "▒"};
+        static const char waves[] = {'.', ':', '-', '=', '-', ':'};
         for (int i = 0; i < width; ++i) {
             int phase = (tick + i) % 6;
             out += waves[phase];
@@ -2468,7 +2514,7 @@ private:
         return out;
     }
 
-    // Mini sparkline for inline stats
+    // Mini sparkline for inline stats - uses ASCII for consistent width
     std::string mini_spark(double value, double max_val, int width) const {
         if (max_val <= 0) max_val = 1.0;
         double frac = value / max_val;
@@ -2478,20 +2524,20 @@ private:
         int filled = (int)(frac * width);
         std::string out;
 
-        if (u8_ok_ && vt_ok_) {
+        if (vt_ok_) {
             out += "\x1b[38;5;51m";  // Cyan
-            for (int i = 0; i < filled; ++i) out += "█";
+            for (int i = 0; i < filled; ++i) out += '#';
             out += "\x1b[38;5;238m";
-            for (int i = filled; i < width; ++i) out += "░";
+            for (int i = filled; i < width; ++i) out += '.';
             out += "\x1b[0m";
         } else {
-            for (int i = 0; i < filled; ++i) out += "#";
-            for (int i = filled; i < width; ++i) out += ".";
+            for (int i = 0; i < filled; ++i) out += '#';
+            for (int i = filled; i < width; ++i) out += '.';
         }
         return out;
     }
 
-    // Premium status indicator with glow
+    // Premium status indicator with glow - uses ASCII for consistent width
     std::string status_indicator(const std::string& status, bool good, int tick) const {
         std::ostringstream out;
         if (vt_ok_) {
@@ -2499,11 +2545,11 @@ private:
                 // Pulsing green glow
                 int brightness = 46 + (tick % 4);
                 out << "\x1b[38;5;" << brightness << "m";
-                out << (u8_ok_ ? "● " : "* ");
+                out << "* ";
             } else {
                 // Warning orange
                 out << "\x1b[38;5;214m";
-                out << (u8_ok_ ? "◐ " : "o ");
+                out << "o ";
             }
             out << status << "\x1b[0m";
         } else {
@@ -2512,21 +2558,21 @@ private:
         return out.str();
     }
 
-    // Animated network activity indicator
+    // Animated network activity indicator - uses ASCII for consistent width
     std::string network_activity(int tick, size_t peers, bool has_activity) const {
         std::ostringstream out;
-        if (u8_ok_ && vt_ok_) {
-            // Network icon with pulse
+        if (vt_ok_) {
+            // Network icon with pulse using ASCII
             if (peers > 0) {
-                static const char* net_frames[] = {"◈", "◇", "◈", "◆"};
+                static const char net_frames[] = {'#', '+', '#', '*'};
                 out << "\x1b[38;5;51m" << net_frames[tick % 4] << "\x1b[0m";
             } else {
-                out << "\x1b[38;5;238m○\x1b[0m";
+                out << "\x1b[38;5;238mo\x1b[0m";
             }
 
-            // Activity arrows
+            // Activity arrows using ASCII
             if (has_activity && peers > 0) {
-                static const char* arrows[] = {"↑", "↗", "→", "↘", "↓", "↙", "←", "↖"};
+                static const char arrows[] = {'^', '/', '>', '\\', 'v', '/', '<', '\\'};
                 out << "\x1b[38;5;46m" << arrows[tick % 8] << "\x1b[0m";
             }
         } else {
@@ -2536,6 +2582,7 @@ private:
     }
 
     // Premium gradient bar for hashrate/performance
+    // Uses ASCII characters for consistent width across all platforms
     std::string gradient_bar(int width, double frac, int tick, const char* start_color = "51", const char* end_color = "46") const {
         if (width < 4) width = 4;
         if (frac < 0.0) frac = 0.0;
@@ -2544,19 +2591,19 @@ private:
         int filled = (int)(frac * width);
         std::ostringstream out;
 
-        if (vt_ok_ && u8_ok_) {
+        if (vt_ok_) {
             for (int i = 0; i < width; ++i) {
                 if (i < filled) {
                     // Gradient from start to end color
                     int color = 51 - (i * 5) / width;  // Cyan to green gradient
                     if (color < 46) color = 46;
-                    out << "\x1b[38;5;" << color << "m█";
+                    out << "\x1b[38;5;" << color << "m#";
                 } else if (i == filled && frac < 1.0) {
-                    // Animated edge
-                    static const char* edge[] = {"▏", "▎", "▍", "▌", "▋", "▊", "▉"};
-                    out << "\x1b[38;5;51m" << edge[tick % 7];
+                    // Animated edge using ASCII
+                    static const char edge[] = {'|', '/', '-', '\\'};
+                    out << "\x1b[38;5;51m" << edge[tick % 4];
                 } else {
-                    out << "\x1b[38;5;236m░";
+                    out << "\x1b[38;5;236m.";
                 }
             }
             out << "\x1b[0m";
@@ -2569,12 +2616,13 @@ private:
     }
 
     // Animated chain blocks visualization
+    // Uses ASCII characters for consistent width across all platforms
     std::string chain_blocks_viz(int tick, uint64_t height) const {
-        if (!u8_ok_ || !vt_ok_) return "[" + std::to_string(height) + "]";
+        if (!vt_ok_) return "[" + std::to_string(height) + "]";
 
         std::ostringstream out;
-        // Show last 5 "blocks" with animation
-        static const char* block_states[] = {"░", "▒", "▓", "█"};
+        // Show last 5 "blocks" with ASCII animation for consistent width
+        static const char block_states[] = {'.', ':', '#', '@'};
 
         for (int i = 0; i < 5; ++i) {
             int phase = (tick + i * 2) % 8;
@@ -2589,17 +2637,18 @@ private:
         return out.str();
     }
 
-    // Mining pickaxe animation
+    // Mining pickaxe animation - uses ASCII for consistent width
     std::string mining_animation(int tick, bool active) const {
-        if (!active) return u8_ok_ ? "⛏" : "[M]";
-        if (u8_ok_ && vt_ok_) {
-            static const char* frames[] = {"⛏ ", " ⛏", "⛏ ", "⛏·"};
+        if (!active) return "[M]";
+        if (vt_ok_) {
+            // Use ASCII animation with consistent width
+            static const char* frames[] = {"[*]", "[+]", "[*]", "[#]"};
             int bright = 46 + (tick % 4);
             std::ostringstream out;
             out << "\x1b[38;5;" << bright << "m" << frames[tick % 4] << "\x1b[0m";
             return out.str();
         }
-        return "[MINING]";
+        return "[M]";
     }
 
     // Draw the premium main dashboard
