@@ -656,10 +656,8 @@ static inline void get_winsize(int& cols, int& rows) {
 }
 
 // Enable VT and probe Unicode ability.
-// IMPORTANT: On Windows, we only enable UTF-8/Unicode mode for terminals that
-// actually support extended Unicode glyphs. PowerShell 5 (legacy) uses fonts
-// like Consolas that don't have glyphs for many Unicode characters, causing
-// garbled output. We detect modern terminals that handle Unicode properly.
+// On Windows, UTF-8 graphics are ONLY enabled when user explicitly sets MIQ_TUI_UTF8=1
+// This ensures compatibility with PowerShell 5 and other legacy terminals.
 static inline void enable_vt_and_probe_u8(bool& vt_ok, bool& u8_ok) {
     vt_ok = true; u8_ok = false;
 #ifdef _WIN32
@@ -692,61 +690,17 @@ static inline void enable_vt_and_probe_u8(bool& vt_ok, bool& u8_ok) {
         if (is_pipe) vt_ok = true;
     }
 
-    // Check if user explicitly set UTF-8 preference
-    const char* utf8_env = std::getenv("MIQ_TUI_UTF8");
-    const bool force_utf8 = utf8_env && *utf8_env &&
-        (std::strcmp(utf8_env,"1")==0 || std::strcmp(utf8_env,"true")==0 || std::strcmp(utf8_env,"True")==0);
-    const bool disable_utf8 = utf8_env && *utf8_env &&
-        (std::strcmp(utf8_env,"0")==0 || std::strcmp(utf8_env,"false")==0 || std::strcmp(utf8_env,"False")==0);
+    // Only enable UTF-8 graphics if user explicitly requests it
+    // This ensures maximum compatibility with legacy terminals
+    const bool force_utf8 = []{
+        const char* s = std::getenv("MIQ_TUI_UTF8");
+        return s && *s ? (std::strcmp(s,"0")!=0 && std::strcmp(s,"false")!=0 && std::strcmp(s,"False")!=0) : false;
+    }();
 
-    // Detect modern terminals that properly support Unicode:
-    // - Windows Terminal (WT_SESSION env var)
-    // - ConEmu (ConEmuANSI env var)
-    // - VS Code integrated terminal (TERM_PROGRAM=vscode)
-    // - MSYS2/Git Bash/MinGW (MSYSTEM or MSYS env var)
-    // - Alacritty, WezTerm, etc (TERM_PROGRAM set)
-    //
-    // Legacy PowerShell 5 running in conhost.exe does NOT properly render
-    // extended Unicode characters (box-drawing, emojis, Braille, etc.)
-    // even with code page 65001 set - the default fonts lack glyphs.
-    const bool is_modern_terminal =
-        std::getenv("WT_SESSION") ||           // Windows Terminal
-        std::getenv("ConEmuANSI") ||           // ConEmu
-        std::getenv("TERM_PROGRAM") ||         // VS Code, Alacritty, WezTerm, etc.
-        std::getenv("MSYSTEM") ||              // MSYS2/MinGW
-        std::getenv("MSYS") ||                 // MSYS
-        std::getenv("TERMINUS_SUBPROC") ||     // Terminus
-        std::getenv("ALACRITTY_LOG") ||        // Alacritty
-        std::getenv("WEZTERM_PANE");           // WezTerm
-
-    // Set UTF-8 code page for proper string handling
-    if (have_console) {
+    if (force_utf8 && have_console) {
         SetConsoleOutputCP(CP_UTF8);
         SetConsoleCP(CP_UTF8);
-
-        // Enable stdin VT sequences if available
-        HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
-        if (hIn && hIn != INVALID_HANDLE_VALUE) {
-            DWORD inMode = 0;
-            if (GetConsoleMode(hIn, &inMode)) {
-                inMode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
-                SetConsoleMode(hIn, inMode);
-            }
-        }
-    }
-
-    // Only enable Unicode graphics on modern terminals or if user forces it
-    // Default to ASCII mode for legacy PowerShell 5 / conhost.exe
-    if (force_utf8) {
         u8_ok = true;
-    } else if (disable_utf8) {
-        u8_ok = false;
-    } else if (is_modern_terminal) {
-        u8_ok = true;
-    } else {
-        // Legacy Windows console (PowerShell 5, cmd.exe in conhost)
-        // Use ASCII-safe mode to avoid garbled characters
-        u8_ok = false;
     }
 
     if (hConOut != INVALID_HANDLE_VALUE) CloseHandle(hConOut);
@@ -888,13 +842,13 @@ static inline bool env_truthy_local(const char* name){
     return true;
 }
 
-// UTF-8 enabled by default (opt-out model for Windows PowerShell 5+ compatibility)
-// Returns true unless MIQ_TUI_UTF8 is explicitly set to 0/false
+// UTF-8 disabled by default for Windows compatibility
+// Returns true only if MIQ_TUI_UTF8 is explicitly set to 1/true
 static inline bool is_utf8_enabled(){
     const char* v = std::getenv("MIQ_TUI_UTF8");
-    if(!v||!*v) return true;  // Default: enabled
+    if(!v||!*v) return false;  // Default: disabled for compatibility
     if(std::strcmp(v,"0")==0 || std::strcmp(v,"false")==0 || std::strcmp(v,"False")==0) return false;
-    return true;
+    return true;  // Only true if explicitly set to something other than 0/false
 }
 
 // Bytes pretty-printer
@@ -4125,11 +4079,12 @@ private:
         }
     }
 
-    // Cyber matrix-style rain effect for splash background
+    // Cyber matrix-style rain effect for splash background (ASCII-safe)
     static std::string cyber_rain(int width, int tick, bool vt) {
         if (!vt) return "";
         std::string out;
-        static const char* chars[] = {"0", "1", "ø", "×", "·", " ", " ", " "};
+        // ASCII-safe characters only for maximum compatibility
+        static const char* chars[] = {"0", "1", "o", "x", ".", " ", " ", " "};
         for (int i = 0; i < width; ++i) {
             int phase = (tick + i * 3) % 8;
             int brightness = (tick + i * 7) % 6;
@@ -4287,22 +4242,13 @@ private:
             out += "\x1b[0m\x1b[38;5;27m▌\x1b[0m";  // Right cap
 
         } else if (vt_ok_) {
-            // ANSI fallback with nice gradient effect
-            out += "\x1b[1m[\x1b[0m";
-            for (int i = 0; i < inner; ++i) {
-                if (i < filled) {
-                    // Simple gradient: green
-                    double pos = (double)i / (double)inner;
-                    if (pos < 0.5) out += "\x1b[36m";  // Cyan
-                    else out += "\x1b[32m";  // Green
-                    out += "█";
-                } else if (i == filled && frac < 1.0) {
-                    out += "\x1b[33m▓\x1b[0m";  // Yellow edge
-                } else {
-                    out += "\x1b[90m░\x1b[0m";
-                }
-            }
-            out += "\x1b[1m]\x1b[0m";
+            // ANSI fallback using BACKGROUND COLORS - works in ANY terminal!
+            // This creates a solid colored bar using spaces with colored backgrounds
+            out += "\x1b[42m\x1b[30m";  // Green background, black text for filled
+            for (int i = 0; i < filled; ++i) out += " ";
+            out += "\x1b[0m\x1b[47m\x1b[30m";  // Gray/white background for empty
+            for (int i = filled; i < inner; ++i) out += " ";
+            out += "\x1b[0m";
         } else {
             // Plain ASCII with nice pattern
             out += "[";
