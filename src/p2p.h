@@ -409,6 +409,11 @@ public:
     void broadcast_inv_block(const std::vector<uint8_t>& h);
     void broadcast_inv_tx(const std::vector<uint8_t>& txid);
 
+    // CRITICAL FIX: Store raw transaction for serving to peers via gettx
+    // This must be called when a tx is accepted via RPC (sendrawtransaction)
+    // so that peers can fetch the full tx after receiving the invtx announcement
+    void store_tx_for_relay(const std::vector<uint8_t>& txid, const std::vector<uint8_t>& raw_tx);
+
     // BIP130 sendheaders support
     void send_sendheaders(PeerState& ps);
     void broadcast_header(const std::vector<uint8_t>& header_data);

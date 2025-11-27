@@ -2673,6 +2673,40 @@ void P2P::broadcast_inv_tx(const std::vector<uint8_t>& txid){
     if (announce_tx_q_.size() < 8192) announce_tx_q_.push_back(txid);
 }
 
+// CRITICAL FIX: Store raw transaction for serving to peers
+// This is called by RPC sendrawtransaction so peers can fetch the full tx
+// after receiving the invtx announcement. Without this, peers would send
+// gettx but we'd have nothing to serve them!
+void P2P::store_tx_for_relay(const std::vector<uint8_t>& txid, const std::vector<uint8_t>& raw_tx){
+    if (txid.size() != 32 || raw_tx.empty()) return;
+
+    std::string key;
+    key.reserve(64);
+    static const char hex[] = "0123456789abcdef";
+    for (uint8_t b : txid) {
+        key.push_back(hex[b >> 4]);
+        key.push_back(hex[b & 0xf]);
+    }
+
+    // Note: No lock needed here since this is called from RPC thread
+    // and the main loop accesses tx_store_ from its own thread.
+    // However, for safety, we should use the announce_tx_mu_ lock.
+    std::lock_guard<std::mutex> lk(announce_tx_mu_);
+
+    if (tx_store_.find(key) == tx_store_.end()) {
+        tx_store_[key] = raw_tx;
+        tx_order_.push_back(key);
+        if (tx_store_.size() > MIQ_TX_STORE_MAX) {
+            auto victim = tx_order_.front();
+            tx_order_.pop_front();
+            tx_store_.erase(victim);
+        }
+    }
+
+    // Also mark as seen so we don't process it again if a peer relays it back
+    seen_txids_.insert(key);
+}
+
 static void trickle_flush(){
     int64_t tnow = now_ms();
     for (auto& kv : g_trickle_q) {
@@ -5163,8 +5197,13 @@ void P2P::loop(){
                             if (!inv_tick(1)) { continue; }
                             auto key = hexkey(m.payload);
                             if (!remember_inv(key)) { continue; }
+                            // CRITICAL FIX: Do NOT insert into seen_txids_ here!
+                            // Only check if we've already processed this transaction.
+                            // The actual insert into seen_txids_ happens in the "tx" handler
+                            // AFTER successful processing. The old code inserted here which
+                            // caused the tx handler to skip processing when the actual tx
+                            // data arrived (because seen_txids_.insert().second would be false).
                             if (!seen_txids_.count(key)) {
-                                seen_txids_.insert(key);
                                 request_tx(ps, m.payload);
                             }
                         }

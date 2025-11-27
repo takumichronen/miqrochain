@@ -1171,6 +1171,9 @@ std::string RpcService::handle(const std::string& body){
                 // Without this, transactions only sit in local mempool and never propagate!
                 if(p2p_) {
                     std::vector<uint8_t> txid = tx.txid();
+                    // CRITICAL FIX: Store raw tx so we can serve it when peers request via gettx
+                    // Without this, peers receive invtx, send gettx, but we have nothing to serve!
+                    p2p_->store_tx_for_relay(txid, raw);
                     p2p_->broadcast_inv_tx(txid);
                 }
                 JNode r; r.v = std::string(to_hex(tx.txid())); return json_dump(r);
