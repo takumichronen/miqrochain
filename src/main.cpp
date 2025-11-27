@@ -877,7 +877,7 @@ static inline std::string fmt_num(uint64_t n){
 }
 
 // Percentage with color hint
-static inline std::string fmt_pct(double pct, bool use_color = false){
+[[maybe_unused]] static inline std::string fmt_pct(double pct, bool use_color = false){
     (void)use_color;  // Reserved for future color formatting
     std::ostringstream o;
     o << std::fixed << std::setprecision(1) << pct << "%";
@@ -885,7 +885,7 @@ static inline std::string fmt_pct(double pct, bool use_color = false){
 }
 
 // Age string (time since timestamp)
-static inline std::string fmt_age(uint64_t timestamp_s){
+[[maybe_unused]] static inline std::string fmt_age(uint64_t timestamp_s){
     uint64_t now = (uint64_t)std::time(nullptr);
     if (timestamp_s == 0 || timestamp_s > now) return "unknown";
     uint64_t age = now - timestamp_s;
@@ -893,7 +893,7 @@ static inline std::string fmt_age(uint64_t timestamp_s){
 }
 
 // Block time estimation
-static inline std::string fmt_block_time(uint64_t blocks, uint64_t target_secs){
+[[maybe_unused]] static inline std::string fmt_block_time(uint64_t blocks, uint64_t target_secs){
     uint64_t est_secs = blocks * target_secs;
     return fmt_uptime(est_secs);
 }
@@ -1081,7 +1081,7 @@ static inline std::string spinner(int tick, bool fancy){
 }
 
 // Additional animated indicators for professional look
-static inline std::string activity_indicator(int tick, bool active, bool fancy){
+[[maybe_unused]] static inline std::string activity_indicator(int tick, bool active, bool fancy){
     if (!active) return fancy ? "○" : "o";
     if (fancy){
         static const char* frames[] = {"◐","◓","◑","◒"};
@@ -1092,7 +1092,7 @@ static inline std::string activity_indicator(int tick, bool active, bool fancy){
     }
 }
 
-static inline std::string pulse_indicator(int tick, bool fancy){
+[[maybe_unused]] static inline std::string pulse_indicator(int tick, bool fancy){
     if (fancy){
         static const char* frames[] = {"▁","▂","▃","▄","▅","▆","▇","█","▇","▆","▅","▄","▃","▂"};
         return frames[(size_t)(tick % 14)];

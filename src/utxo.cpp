@@ -12,7 +12,6 @@ namespace miq {
 // CRITICAL FIX: Maximum limits to prevent DoS and buffer overflows
 static constexpr uint32_t MAX_TXID_SIZE = 64;       // Max txid size (typical is 32)
 static constexpr uint32_t MAX_PKH_SIZE = 64;        // Max pubkey hash size (typical is 20)
-static constexpr size_t MAX_LOG_SIZE = 10ULL * 1024 * 1024 * 1024;  // 10 GiB max log
 
 std::string UTXOSet::key(const std::vector<uint8_t>& txid, uint32_t vout) const {
     // Stable and simple: hex(txid) + ":" + vout

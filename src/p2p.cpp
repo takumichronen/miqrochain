@@ -96,12 +96,6 @@
 #ifndef MIQ_RUNTIME_TRACE
 #define MIQ_RUNTIME_TRACE 0
 #endif
-static std::atomic<bool> g_runtime_trace_enabled{MIQ_RUNTIME_TRACE != 0};
-#define P2P_TRACE_IF(cond, msg) do { \
-  if ((cond) && g_runtime_trace_enabled.load(std::memory_order_relaxed)) { \
-    ::miq::log_info(std::string("[TRACE-COND] ") + (msg)); \
-  } \
-} while(0)
 
 #if !defined(MIQ_MAYBE_UNUSED)
   #if defined(__GNUC__) || defined(__clang__)
@@ -449,34 +443,6 @@ static inline void miq_set_cloexec(Sock s) {
 #ifndef MIQ_SOCK_SNDBUF
 #define MIQ_SOCK_SNDBUF (256 * 1024)
 #endif
-
-static inline void miq_optimize_socket(Sock s) {
-    // Set larger socket buffers for high-throughput block transfers
-    int rcvbuf = MIQ_SOCK_RCVBUF;
-    int sndbuf = MIQ_SOCK_SNDBUF;
-    (void)setsockopt(s, SOL_SOCKET, SO_RCVBUF,
-                     reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
-    (void)setsockopt(s, SOL_SOCKET, SO_SNDBUF,
-                     reinterpret_cast<const char*>(&sndbuf), sizeof(sndbuf));
-
-    // Disable Nagle's algorithm for lower latency
-    int nodelay = 1;
-    (void)setsockopt(s, IPPROTO_TCP, TCP_NODELAY,
-                     reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
-
-#ifdef SO_REUSEADDR
-    int reuse = 1;
-    (void)setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
-                     reinterpret_cast<const char*>(&reuse), sizeof(reuse));
-#endif
-
-#ifdef TCP_QUICKACK
-    // Enable TCP_QUICKACK for faster ACKs (Linux-specific)
-    int quickack = 1;
-    (void)setsockopt(s, IPPROTO_TCP, TCP_QUICKACK,
-                     reinterpret_cast<const char*>(&quickack), sizeof(quickack));
-#endif
-}
 
 static inline void miq_set_keepalive(Sock s) {
     int one = 1;
@@ -997,26 +963,6 @@ static inline void maybe_mark_headers_done(bool at_tip) {
 
 static bool g_sync_green_logged = false;
 
-// Thread-safe global inflight tracking at file scope
-// (separate from the more sophisticated SpinLock-based system in the anonymous namespace below)
-static std::mutex g_file_scope_inflight_mu;
-static std::unordered_set<std::string> g_file_scope_inflight_blocks;
-
-[[maybe_unused]] static bool is_block_inflight(const std::string& hash) {
-    std::lock_guard<std::mutex> lk(g_file_scope_inflight_mu);
-    return g_file_scope_inflight_blocks.find(hash) != g_file_scope_inflight_blocks.end();
-}
-
-static void add_file_scope_inflight(const std::string& hash) {
-    std::lock_guard<std::mutex> lk(g_file_scope_inflight_mu);
-    g_file_scope_inflight_blocks.insert(hash);
-}
-
-static void remove_file_scope_inflight(const std::string& hash) {
-    std::lock_guard<std::mutex> lk(g_file_scope_inflight_mu);
-    g_file_scope_inflight_blocks.erase(hash);
-}
-
 static std::unordered_map<Sock,int> g_index_timeouts;
 static inline void mark_index_timeout(Sock s){
     int &c = g_index_timeouts[s]; if (++c >= 3) g_peer_index_capable[s] = false;
@@ -1096,9 +1042,6 @@ public:
     }
 };
 
-// Global spinlock protecting all inflight state
-static SpinLock g_inflight_lock;
-
 // Track inflight block request timestamps without touching PeerState layout
 static std::unordered_map<Sock, std::unordered_map<std::string,int64_t>> g_inflight_block_ts;
 
@@ -1122,40 +1065,6 @@ public:
 
 // Note: is_block_inflight is defined at file scope, outside this namespace,
 // so it can be forward-declared and used by unsolicited_drop above.
-
-static inline void mark_block_inflight(const std::string& hash, Sock sock) {
-    InflightLock lk(g_inflight_lock);
-    g_global_inflight_blocks.insert(hash);
-    g_inflight_block_ts[sock][hash] = now_ms();
-    // Also update file-scope set for unsolicited_drop()
-    add_file_scope_inflight(hash);
-}
-
-static inline void clear_block_inflight(const std::string& hash, Sock sock) {
-    InflightLock lk(g_inflight_lock);
-    g_global_inflight_blocks.erase(hash);
-    auto it = g_inflight_block_ts.find(sock);
-    if (it != g_inflight_block_ts.end()) {
-        it->second.erase(hash);
-    }
-    // Also update file-scope set
-    remove_file_scope_inflight(hash);
-}
-
-static inline void clear_all_inflight_for_sock(Sock sock) {
-    InflightLock lk(g_inflight_lock);
-    auto it = g_inflight_block_ts.find(sock);
-    if (it != g_inflight_block_ts.end()) {
-        for (const auto& kv : it->second) {
-            g_global_inflight_blocks.erase(kv.first);
-            // Also update file-scope set
-            remove_file_scope_inflight(kv.first);
-        }
-        g_inflight_block_ts.erase(it);
-    }
-    g_inflight_index_ts.erase(sock);
-    g_inflight_index_order.erase(sock);
-}
 
 } // namespace
 
@@ -4106,7 +4015,7 @@ void P2P::loop(){
                  }
             }
             // Improved sync completion logic: check if we have exhausted all sync methods
-            const size_t current_height = chain_.height();
+            const uint64_t current_height = chain_.height();
             bool can_try_index_sync = false;
             bool has_active_index_sync = false;
 

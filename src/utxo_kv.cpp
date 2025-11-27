@@ -13,10 +13,6 @@ static inline void put_u64le(std::string& s, uint64_t x){
     for(int i=0;i<8;i++) b[i]=char((x>>(8*i))&0xff);
     s.append(b,8);
 }
-static inline uint32_t get_u32le(const char* p){ return (uint32_t(uint8_t(p[0]))      ) |
-                                                          (uint32_t(uint8_t(p[1]))<<8 ) |
-                                                          (uint32_t(uint8_t(p[2]))<<16) |
-                                                          (uint32_t(uint8_t(p[3]))<<24); }
 static inline uint64_t get_u64le(const char* p){ uint64_t v=0; for(int i=0;i<8;i++) v|=(uint64_t(uint8_t(p[i]))<<(8*i)); return v; }
 
 bool UTXOKV::open(const std::string& dir, std::string* err){

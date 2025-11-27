@@ -1185,7 +1185,7 @@ void Chain::rebuild_header_index_from_blocks(){
 
     // Count actual blocks in storage (handle gaps)
     // Scan the full range up to tip_.height to find all blocks (including gaps)
-    uint64_t actual_block_count = 0;
+    [[maybe_unused]] uint64_t actual_block_count = 0;
     uint64_t highest_block_found = 0;
     for (uint64_t h = 0; h <= tip_.height; ++h) {
         Block blk;

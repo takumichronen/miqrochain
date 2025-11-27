@@ -293,64 +293,64 @@ namespace instant_input {
 // =============================================================================
 namespace wallet_config {
     // Network resilience - enhanced for robustness
-    static constexpr int MAX_CONNECTION_RETRIES = 8;
-    static constexpr int BASE_RETRY_DELAY_MS = 500;
-    static constexpr int MAX_RETRY_DELAY_MS = 30000;
-    static constexpr int CONNECTION_TIMEOUT_MS = 20000;
-    static constexpr int BROADCAST_TIMEOUT_MS = 15000;
+    [[maybe_unused]] static constexpr int MAX_CONNECTION_RETRIES = 8;
+    [[maybe_unused]] static constexpr int BASE_RETRY_DELAY_MS = 500;
+    [[maybe_unused]] static constexpr int MAX_RETRY_DELAY_MS = 30000;
+    [[maybe_unused]] static constexpr int CONNECTION_TIMEOUT_MS = 20000;
+    [[maybe_unused]] static constexpr int BROADCAST_TIMEOUT_MS = 15000;
 
     // Security limits - hardened
-    static constexpr size_t MAX_UTXO_COUNT = 100000;
-    static constexpr size_t MAX_TX_INPUTS = 500;
-    static constexpr size_t MAX_TX_OUTPUTS = 50;
-    static constexpr uint64_t MAX_SINGLE_TX_VALUE = 1000000ULL * 100000000ULL;
-    static constexpr uint64_t DUST_THRESHOLD = 546;
-    static constexpr uint64_t MIN_RELAY_FEE = 1000;  // Minimum fee for relay
+    [[maybe_unused]] static constexpr size_t MAX_UTXO_COUNT = 100000;
+    [[maybe_unused]] static constexpr size_t MAX_TX_INPUTS = 500;
+    [[maybe_unused]] static constexpr size_t MAX_TX_OUTPUTS = 50;
+    [[maybe_unused]] static constexpr uint64_t MAX_SINGLE_TX_VALUE = 1000000ULL * 100000000ULL;
+    [[maybe_unused]] static constexpr uint64_t DUST_THRESHOLD = 546;
+    [[maybe_unused]] static constexpr uint64_t MIN_RELAY_FEE = 1000;  // Minimum fee for relay
 
     // Memory management
-    static constexpr size_t MAX_PENDING_CACHE = 10000;
-    static constexpr size_t KEY_DERIVATION_BATCH = 100;
+    [[maybe_unused]] static constexpr size_t MAX_PENDING_CACHE = 10000;
+    [[maybe_unused]] static constexpr size_t KEY_DERIVATION_BATCH = 100;
 
     // Live update system
-    static constexpr int LIVE_UPDATE_INTERVAL_MS = 5000;
-    static constexpr int SYNC_PROGRESS_INTERVAL_MS = 200;
-    static constexpr int BALANCE_REFRESH_COOLDOWN_MS = 2000;
-    static constexpr int AUTO_REFRESH_INTERVAL_SEC = 30;
+    [[maybe_unused]] static constexpr int LIVE_UPDATE_INTERVAL_MS = 5000;
+    [[maybe_unused]] static constexpr int SYNC_PROGRESS_INTERVAL_MS = 200;
+    [[maybe_unused]] static constexpr int BALANCE_REFRESH_COOLDOWN_MS = 2000;
+    [[maybe_unused]] static constexpr int AUTO_REFRESH_INTERVAL_SEC = 30;
 
     // Transaction queue system - enhanced
-    static constexpr int MAX_QUEUE_SIZE = 1000;
-    static constexpr int AUTO_BROADCAST_INTERVAL_MS = 15000;
-    static constexpr int TX_EXPIRY_HOURS = 72;
-    static constexpr int MAX_BROADCAST_ATTEMPTS = 15;
-    static constexpr int CONFIRMATION_TARGET = 6;
+    [[maybe_unused]] static constexpr int MAX_QUEUE_SIZE = 1000;
+    [[maybe_unused]] static constexpr int AUTO_BROADCAST_INTERVAL_MS = 15000;
+    [[maybe_unused]] static constexpr int TX_EXPIRY_HOURS = 72;
+    [[maybe_unused]] static constexpr int MAX_BROADCAST_ATTEMPTS = 15;
+    [[maybe_unused]] static constexpr int CONFIRMATION_TARGET = 6;
 
     // v9.0 FIX: Reduced pending timeout for faster balance updates
     // If a transaction hasn't been confirmed within this time, release the UTXOs
     // 5 minutes is enough for transaction to propagate and be seen in mempool
-    static constexpr int PENDING_TIMEOUT_MINUTES = 5;
-    static constexpr int64_t PENDING_TIMEOUT_SECONDS = PENDING_TIMEOUT_MINUTES * 60;
+    [[maybe_unused]] static constexpr int PENDING_TIMEOUT_MINUTES = 5;
+    [[maybe_unused]] static constexpr int64_t PENDING_TIMEOUT_SECONDS = PENDING_TIMEOUT_MINUTES * 60;
 
     // v9.0 FIX: Faster rebroadcast for reliable transaction delivery
     // Transactions with "broadcast" status should be rebroadcast periodically
-    static constexpr int REBROADCAST_INTERVAL_MINUTES = 2;
-    static constexpr int64_t REBROADCAST_INTERVAL_SECONDS = REBROADCAST_INTERVAL_MINUTES * 60;
+    [[maybe_unused]] static constexpr int REBROADCAST_INTERVAL_MINUTES = 2;
+    [[maybe_unused]] static constexpr int64_t REBROADCAST_INTERVAL_SECONDS = REBROADCAST_INTERVAL_MINUTES * 60;
 
     // v9.0: Quick confirmation check interval (seconds)
     // How often to verify transaction is in mempool/confirmed
-    static constexpr int QUICK_CONFIRM_CHECK_SECONDS = 30;
+    [[maybe_unused]] static constexpr int QUICK_CONFIRM_CHECK_SECONDS = 30;
 
     // Animation timings (PowerShell 5+ compatible)
-    static constexpr int ANIMATION_FRAME_MS = 80;
-    static constexpr int FAST_ANIMATION_MS = 50;
-    static constexpr int SLOW_ANIMATION_MS = 150;
+    [[maybe_unused]] static constexpr int ANIMATION_FRAME_MS = 80;
+    [[maybe_unused]] static constexpr int FAST_ANIMATION_MS = 50;
+    [[maybe_unused]] static constexpr int SLOW_ANIMATION_MS = 150;
 
     // Smart fee estimation
-    static constexpr uint64_t FEE_RATE_ECONOMY = 1;    // 1 sat/byte
-    static constexpr uint64_t FEE_RATE_NORMAL = 2;     // 2 sat/byte
-    static constexpr uint64_t FEE_RATE_PRIORITY = 5;   // 5 sat/byte
-    static constexpr uint64_t FEE_RATE_URGENT = 10;    // 10 sat/byte
-    static constexpr uint64_t FEE_RATE_MAX = 100;      // 100 sat/byte max
-    static constexpr int SPINNER_FRAME_MS = 80;
+    [[maybe_unused]] static constexpr uint64_t FEE_RATE_ECONOMY = 1;    // 1 sat/byte
+    [[maybe_unused]] static constexpr uint64_t FEE_RATE_NORMAL = 2;     // 2 sat/byte
+    [[maybe_unused]] static constexpr uint64_t FEE_RATE_PRIORITY = 5;   // 5 sat/byte
+    [[maybe_unused]] static constexpr uint64_t FEE_RATE_URGENT = 10;    // 10 sat/byte
+    [[maybe_unused]] static constexpr uint64_t FEE_RATE_MAX = 100;      // 100 sat/byte max
+    [[maybe_unused]] static constexpr int SPINNER_FRAME_MS = 80;
 }
 
 #include "constants.h"
@@ -2371,7 +2371,7 @@ namespace live_dashboard {
 
         // Fill with spaces for consistent width and timestamp
         int64_t now = time(nullptr);
-        struct tm* t = localtime(&now);
+        struct tm* t = localtime((time_t*)&now);
         char time_buf[16];
         strftime(time_buf, sizeof(time_buf), "%H:%M:%S", t);
 
@@ -4018,7 +4018,6 @@ static void log_wallet_event(const std::string& wdir, const std::string& event){
 
 namespace ui_pro {
     // Animation state
-    static std::atomic<bool> g_animation_running{false};
     static std::atomic<int> g_animation_frame{0};
 
     // Professional spinner frames (ASCII compatible)
@@ -6666,45 +6665,6 @@ static std::string confirmation_bar(uint32_t confirmations, int width = 6) {
     return bar;
 }
 
-// Extended progress bar with percentage and status text
-static std::string confirmation_bar_extended(uint32_t confirmations, int bar_width = 10) {
-    std::string result;
-    std::string reset = "\033[0m";
-
-    // Progress calculation
-    double progress = std::min(100.0, confirmations * 100.0 / 6.0);
-    int filled = (int)(progress * bar_width / 100.0);
-
-    // Status text
-    std::string status;
-    if (confirmations == 0) {
-        status = "\033[38;5;214m⏳ PENDING" + reset;
-    } else if (confirmations >= 6) {
-        status = "\033[38;5;46m✓ CONFIRMED" + reset;
-    } else {
-        status = get_confirmation_color(confirmations) + std::to_string(confirmations) + "/6" + reset;
-    }
-
-    // Build the bar
-    result = get_confirmation_color(confirmations) + "│";
-
-    for (int i = 0; i < bar_width; i++) {
-        if (confirmations == 0) {
-            result += "\033[38;5;214m░" + reset;
-        } else if (i < filled) {
-            // Gradient fill
-            int pos_conf = (i * 6 / bar_width) + 1;
-            result += get_confirmation_color(std::min(pos_conf, (int)confirmations)) + "█" + reset;
-        } else {
-            result += "\033[38;5;240m░" + reset;
-        }
-    }
-
-    result += get_confirmation_color(confirmations) + "│" + reset + " " + status;
-
-    return result;
-}
-
 // Print single transaction row
 static void print_tx_row(const TxDetailedEntry& tx, int index, bool selected,
                          const std::vector<AddressBookEntry>& address_book) {
@@ -7304,7 +7264,6 @@ static bool bulletproof_broadcast(
     }
 
     int successful_broadcasts = 0;
-    int total_attempts = 0;
     std::string first_success;
     std::vector<std::string> errors;
 
@@ -7320,7 +7279,6 @@ static bool bulletproof_broadcast(
         }
 
         for (int attempt = 0; attempt < 3; attempt++) {
-            total_attempts++;
             std::string local_err;
 
             miq::P2PLight p2p;
@@ -7501,7 +7459,6 @@ static int process_tx_queue(
     if(queue.empty()) return 0;
 
     int broadcasted = 0;
-    int failed_or_expired = 0;
     int64_t now = (int64_t)time(nullptr);
 
     for(auto& tx : queue){
@@ -7529,7 +7486,6 @@ static int process_tx_queue(
             // CRITICAL FIX: Release inputs back to spendable pool
             if(!tx.raw_tx.empty()){
                 remove_inputs_from_pending(wdir, tx.raw_tx, pending);
-                failed_or_expired++;
                 if(verbose){
                     ui::print_warning("TX " + tx.txid_hex.substr(0, 8) + "... failed - inputs released");
                 }
@@ -7546,7 +7502,6 @@ static int process_tx_queue(
             // CRITICAL FIX: Release inputs back to spendable pool
             if(!tx.raw_tx.empty()){
                 remove_inputs_from_pending(wdir, tx.raw_tx, pending);
-                failed_or_expired++;
                 if(verbose){
                     ui::print_warning("TX " + tx.txid_hex.substr(0, 8) + "... expired - inputs released");
                 }
@@ -10097,10 +10052,6 @@ static bool wallet_session(const std::string& cli_host,
                 continue;
             }
 
-            // Calculate total spendable
-            uint64_t total_spendable = 0;
-            for(const auto& u : spendables) total_spendable += u.value;
-
             // Recommend consolidation
             std::cout << "  " << ui::yellow() << ui::bold() << "RECOMMENDATION:" << ui::reset() << "\n";
             std::cout << "  " << ui::dim() << "Your wallet has " << spendables.size() << " UTXOs. This can cause:" << ui::reset() << "\n";
@@ -10480,12 +10431,9 @@ static bool wallet_session(const std::string& cli_host,
 
                 // Statistics bar
                 int confirmed = 0, pending_tx = 0;
-                int64_t total_sent = 0, total_recv = 0;
                 for(const auto& tx : all_txs){
                     if(tx.confirmations >= 6) confirmed++;
                     else pending_tx++;
-                    if(tx.direction == "sent") total_sent += std::abs(tx.amount);
-                    else total_recv += tx.amount;
                 }
 
                 std::ostringstream stats_ss;
@@ -11362,7 +11310,7 @@ namespace main_menu {
 
         // Time
         int64_t now = time(nullptr);
-        struct tm* t = localtime(&now);
+        struct tm* t = localtime((time_t*)&now);
         char time_buf[16];
         strftime(time_buf, sizeof(time_buf), "%H:%M:%S", t);
         std::cout << std::string(W - 45, ' ');

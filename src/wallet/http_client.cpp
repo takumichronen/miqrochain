@@ -45,9 +45,9 @@ namespace miq {
 
 // =============================================================================
 // BULLETPROOF HTTP CLIENT v1.0 - Production-grade HTTP with robust error handling
-// =============================================================================
+// =============================================================================static inline std::string lc(std::string s){
 
-static inline std::string lc(std::string s){
+[[maybe_unused]] static inline std::string lc(std::string s){
     for(char& c : s) c = (char)std::tolower((unsigned char)c);
     return s;
 }
