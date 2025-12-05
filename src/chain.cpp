@@ -945,6 +945,11 @@ bool Chain::get_headers_from_locator(const std::vector<std::vector<uint8_t>>& lo
     MIQ_CHAIN_GUARD();
     out.clear();
 
+    // DEBUG: Log the state of header index
+    log_info("[SYNC DEBUG] get_headers_from_locator: header_index_.size()=" + std::to_string(header_index_.size()) +
+             " best_header_key_.empty()=" + std::to_string(best_header_key_.empty()) +
+             " locators.size()=" + std::to_string(locators.size()));
+
     std::unordered_map<std::string, int> lset;
     lset.reserve(locators.size());
     for (const auto& h : locators) lset[hk(h)] = 1;
@@ -952,8 +957,12 @@ bool Chain::get_headers_from_locator(const std::vector<std::vector<uint8_t>>& lo
     if (!best_header_key_.empty()) {
         // STABILITY FIX: Use find() instead of at() to avoid exceptions
         auto best_it = header_index_.find(best_header_key_);
-        if (best_it == header_index_.end()) return true;  // Nothing to return
+        if (best_it == header_index_.end()) {
+            log_warn("[SYNC DEBUG] get_headers_from_locator: best_header_key_ not found in header_index_!");
+            return true;  // Nothing to return
+        }
         const auto* cur = &best_it->second;
+        log_info("[SYNC DEBUG] get_headers_from_locator: best header height=" + std::to_string(cur->height));
 
         std::vector<std::vector<uint8_t>> back_hashes;
         back_hashes.reserve(2048);
@@ -965,11 +974,18 @@ bool Chain::get_headers_from_locator(const std::vector<std::vector<uint8_t>>& lo
             if (lset.find(hk(cur->hash)) != lset.end()) {
                 meet_idx = back_hashes.size() - 1;
                 matched = true;
+                log_info("[SYNC DEBUG] get_headers_from_locator: MATCHED at meet_idx=" + std::to_string(meet_idx) +
+                         " hash=" + to_hex(cur->hash).substr(0,16) + "...");
                 break;
             }
             auto itp = header_index_.find(hk(cur->prev));
             if (itp == header_index_.end()) break;
             cur = &itp->second;
+        }
+
+        if (!matched) {
+            log_warn("[SYNC DEBUG] get_headers_from_locator: NO MATCH found after walking " +
+                     std::to_string(back_hashes.size()) + " headers");
         }
 
         if (matched) {

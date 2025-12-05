@@ -5140,6 +5140,13 @@ void P2P::loop(){
                         if (try_headers) {
                             std::vector<std::vector<uint8_t>> locator;
                             chain_.build_locator(locator);
+                            // DEBUG: Log locator contents for sync debugging
+                            if (!locator.empty()) {
+                                log_info("[SYNC DEBUG] Sending getheaders with " + std::to_string(locator.size()) +
+                                         " locator hashes, first=" + hexkey(locator[0]).substr(0,16) + "...");
+                            } else {
+                                log_info("[SYNC DEBUG] Sending getheaders with EMPTY locator!");
+                            }
                             if (g_hdr_flip[(Sock)s]) {
                                 for (auto& h : locator) std::reverse(h.begin(), h.end());
                             }
@@ -5152,6 +5159,9 @@ void P2P::loop(){
                                 ps.inflight_hdr_batches++;
                                 g_last_hdr_req_ms[(Sock)s] = now_ms();
                                 ps.last_hdr_batch_done_ms  = now_ms();
+                                log_info("[SYNC DEBUG] getheaders SENT to " + ps.ip);
+                            } else {
+                                log_warn("[SYNC DEBUG] getheaders NOT SENT - rate/batch limit to " + ps.ip);
                             }
                             if (!g_logged_headers_started) {
                                 g_logged_headers_started = true;
@@ -5885,21 +5895,34 @@ void P2P::loop(){
                         std::vector<std::vector<uint8_t>> locator;
                         std::vector<uint8_t> stop;
                         if (!parse_getheaders_payload(m.payload, locator, stop)) {
+                            log_warn("[SYNC DEBUG] getheaders parse FAILED from " + ps.ip);
                             if (++ps.mis > 10) { dead.push_back(s); }
                             continue;
+                        }
+
+                        // DEBUG: Log incoming getheaders request
+                        if (!locator.empty()) {
+                            log_info("[SYNC DEBUG] Received getheaders from " + ps.ip +
+                                     " with " + std::to_string(locator.size()) + " locator hashes, first=" +
+                                     hexkey(locator[0]).substr(0,16) + "...");
                         }
 
                         // Try native orientation first (BE as our chain stores it).
                         std::vector<BlockHeader> hs;
                         chain_.get_headers_from_locator(locator, 2000, hs);
                         if (hs.empty() && !locator.empty()) {
+                            log_info("[SYNC DEBUG] Native orientation returned 0 headers, trying reversed");
                             std::vector<std::vector<uint8_t>> loc_rev = locator;
                             for (auto& h : loc_rev) std::reverse(h.begin(), h.end());
                             std::vector<BlockHeader> hs2;
                             chain_.get_headers_from_locator(loc_rev, 2000, hs2);
                             if (!hs2.empty()) hs.swap(hs2);
                         }
-                      
+
+                        // DEBUG: Log how many headers we're sending back
+                        log_info("[SYNC DEBUG] Responding to getheaders from " + ps.ip +
+                                 " with " + std::to_string(hs.size()) + " headers");
+
                         auto out = build_headers_payload(hs);
                         auto msg = encode_msg("headers", out);
                         (void)send_or_close(s, msg);
