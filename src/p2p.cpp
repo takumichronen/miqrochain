@@ -645,10 +645,16 @@ static bool miq_resolve_endpoints_from_string(const std::string& input, uint16_t
     if (miq_try_numeric_v4(host, port, ep)) { out_eps.push_back(ep); return true; }
 
 #ifdef _WIN32
-    ADDRINFOA hints{}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM; hints.ai_flags = AI_ADDRCONFIG;
+    // CRITICAL FIX: Removed AI_ADDRCONFIG flag which can cause DNS resolution
+    // to fail on Windows in certain network configurations (VPN, WSL, etc.)
+    ADDRINFOA hints{}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
     PADDRINFOA res = nullptr;
     int rc = getaddrinfo(host.c_str(), nullptr, &hints, &res);
-    if (rc != 0 || !res) return false;
+    if (rc != 0 || !res) {
+        // Log DNS failure for debugging
+        log_warn("P2P: DNS resolution failed for " + host + " (error=" + std::to_string(rc) + ")");
+        return false;
+    }
     for (auto p = res; p; p = p->ai_next) {
         if (p->ai_family == AF_INET6 && p->ai_addrlen >= (int)sizeof(sockaddr_in6)) {
             sockaddr_in6 a6{}; memcpy(&a6, p->ai_addr, sizeof(a6)); a6.sin6_port = htons(port);
@@ -660,7 +666,8 @@ static bool miq_resolve_endpoints_from_string(const std::string& input, uint16_t
     }
     freeaddrinfo(res);
 #else
-    addrinfo hints{}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM; hints.ai_flags = AI_ADDRCONFIG;
+    // Removed AI_ADDRCONFIG for consistency with Windows path
+    addrinfo hints{}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
     addrinfo* res = nullptr;
     if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res) return false;
     for (addrinfo* p = res; p; p = p->ai_next) {
@@ -2808,6 +2815,18 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
     // CRITICAL: Hold g_peers_mu while modifying peers_ to prevent data race with loop thread
     {
         std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+
+        // CRITICAL FIX: Check for duplicate IP AGAIN before adding (TOCTOU prevention)
+        // Without this, multiple inbound connections can pass the initial check
+        // and all get added, resulting in duplicate peer connections
+        for (const auto& kv : peers_) {
+            if (kv.second.ip == ip) {
+                log_info("P2P: rejecting duplicate inbound (TOCTOU) from " + ip);
+                CLOSESOCK(c);
+                return;
+            }
+        }
+
         peers_[c] = ps;
         g_peer_index_capable[c] = false;
         g_trickle_last_ms[c] = 0;
