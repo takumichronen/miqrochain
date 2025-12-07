@@ -348,6 +348,15 @@ if(WIN32)
   target_link_libraries(miq-keygen PRIVATE bcrypt)
 endif()
 
+# ---------------- Chain Doctor (chain recovery tool) ----------------
+add_executable(miq-chain-doctor src/tools/miq_chain_doctor.cpp)
+target_include_directories(miq-chain-doctor PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(miq-chain-doctor PRIVATE miqcore)
+if(WIN32)
+  target_link_libraries(miq-chain-doctor PRIVATE bcrypt)
+endif()
+set_target_properties(miq-chain-doctor PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES)
+
 # ---------------- Miner app (stand-alone) ----------------
 set(MIQ_MINER_SRC "")
 foreach(cand IN ITEMS

@@ -3429,6 +3429,168 @@ std::string RpcService::handle(const std::string& body){
             JNode out; out.v = result; return json_dump(out);
         }
 
+        // ============================================================================
+        // CHAIN DOCTOR RPC COMMANDS
+        // These commands provide production-grade chain recovery capabilities
+        // ============================================================================
+
+        // disconnectblock - Disconnect the tip block (for chain recovery)
+        // params: [count] - optional number of blocks to disconnect (default: 1)
+        if(method=="disconnectblock"){
+            uint64_t count = 1;
+            if (params.size() >= 1 && std::holds_alternative<double>(params[0].v)) {
+                count = static_cast<uint64_t>(std::get<double>(params[0].v));
+            }
+
+            // Safety limit - don't allow disconnecting more than 100 blocks at once
+            if (count > 100) {
+                return err("cannot disconnect more than 100 blocks at once (safety limit)");
+            }
+
+            auto tip = chain_.tip();
+            if (tip.height < count) {
+                return err("cannot disconnect " + std::to_string(count) + " blocks - only " + std::to_string(tip.height) + " blocks exist");
+            }
+
+            std::vector<std::string> disconnected_hashes;
+            uint64_t start_height = tip.height;
+
+            for (uint64_t i = 0; i < count; ++i) {
+                std::string disconnect_err;
+                auto before_tip = chain_.tip();
+
+                if (!chain_.disconnect_tip_once(disconnect_err)) {
+                    // Report what we managed to disconnect before failure
+                    std::map<std::string, JNode> result;
+                    result["success"] = jbool(false);
+                    result["error"] = jstr(disconnect_err);
+                    result["disconnected_count"] = jnum((double)disconnected_hashes.size());
+                    result["start_height"] = jnum((double)start_height);
+                    result["current_height"] = jnum((double)chain_.tip().height);
+
+                    std::vector<JNode> hashes_arr;
+                    for (const auto& h : disconnected_hashes) {
+                        JNode n; n.v = h; hashes_arr.push_back(n);
+                    }
+                    JNode arr; arr.v = hashes_arr;
+                    result["disconnected_hashes"] = arr;
+
+                    JNode out; out.v = result; return json_dump(out);
+                }
+
+                disconnected_hashes.push_back(to_hex(before_tip.hash));
+                log_info("disconnectblock: disconnected block " + std::to_string(before_tip.height) +
+                         " hash=" + to_hex(before_tip.hash).substr(0, 16) + "...");
+            }
+
+            // Success - all blocks disconnected
+            std::map<std::string, JNode> result;
+            result["success"] = jbool(true);
+            result["disconnected_count"] = jnum((double)count);
+            result["start_height"] = jnum((double)start_height);
+            result["new_height"] = jnum((double)chain_.tip().height);
+            result["new_tip_hash"] = jstr(to_hex(chain_.tip().hash));
+
+            std::vector<JNode> hashes_arr;
+            for (const auto& h : disconnected_hashes) {
+                JNode n; n.v = h; hashes_arr.push_back(n);
+            }
+            JNode arr; arr.v = hashes_arr;
+            result["disconnected_hashes"] = arr;
+
+            JNode out; out.v = result; return json_dump(out);
+        }
+
+        // validatechain - Validate chain integrity (quick check)
+        // Returns info about chain state and any detected issues
+        if(method=="validatechain"){
+            std::map<std::string, JNode> result;
+            auto tip = chain_.tip();
+
+            result["height"] = jnum((double)tip.height);
+            result["tip_hash"] = jstr(to_hex(tip.hash));
+            result["utxo_count"] = jnum((double)chain_.utxo().size());
+
+            // Check last N blocks for connectivity
+            uint64_t check_depth = 50;
+            if (params.size() >= 1 && std::holds_alternative<double>(params[0].v)) {
+                check_depth = static_cast<uint64_t>(std::get<double>(params[0].v));
+            }
+            if (check_depth > tip.height) check_depth = tip.height;
+
+            bool chain_valid = true;
+            std::string chain_error;
+            uint64_t error_height = 0;
+
+            // Verify chain connectivity
+            Block cur_block;
+            if (chain_.get_block_by_hash(tip.hash, cur_block)) {
+                for (uint64_t i = 0; i < check_depth && chain_valid; ++i) {
+                    uint64_t h = tip.height - i;
+                    if (h == 0) break;
+
+                    Block prev_block;
+                    if (!chain_.get_block_by_hash(cur_block.header.prev_hash, prev_block)) {
+                        chain_valid = false;
+                        chain_error = "missing parent block";
+                        error_height = h;
+                        break;
+                    }
+
+                    // Verify the prev_hash actually points to parent
+                    if (cur_block.header.prev_hash != prev_block.block_hash()) {
+                        chain_valid = false;
+                        chain_error = "prev_hash mismatch";
+                        error_height = h;
+                        break;
+                    }
+
+                    cur_block = prev_block;
+                }
+            } else {
+                chain_valid = false;
+                chain_error = "cannot read tip block";
+            }
+
+            result["chain_valid"] = jbool(chain_valid);
+            result["checked_depth"] = jnum((double)check_depth);
+
+            if (!chain_valid) {
+                result["error"] = jstr(chain_error);
+                result["error_height"] = jnum((double)error_height);
+                result["recommendation"] = jstr("Use miq-chain-doctor scan to find corruption, then truncate to fix");
+            }
+
+            JNode out; out.v = result; return json_dump(out);
+        }
+
+        // getchaindiagnostics - Get detailed chain diagnostics
+        if(method=="getchaindiagnostics"){
+            std::map<std::string, JNode> result;
+            auto tip = chain_.tip();
+
+            // Basic info
+            result["height"] = jnum((double)tip.height);
+            result["tip_hash"] = jstr(to_hex(tip.hash));
+            result["tip_time"] = jnum((double)tip.time);
+            result["tip_bits"] = jnum((double)tip.bits);
+            result["total_issued"] = jnum((double)tip.issued);
+            result["utxo_count"] = jnum((double)chain_.utxo().size());
+
+            // Index stats
+            result["txindex_entries"] = jnum((double)chain_.txindex().size());
+            result["addressindex_enabled"] = jbool(chain_.addressindex().is_enabled());
+            if (chain_.addressindex().is_enabled()) {
+                result["addressindex_addresses"] = jnum((double)chain_.addressindex().address_count());
+                result["addressindex_height"] = jnum((double)chain_.addressindex().best_indexed_height());
+            }
+
+            // Data directory info
+            result["datadir"] = jstr(chain_.datadir());
+
+            JNode out; out.v = result; return json_dump(out);
+        }
+
         return err("unknown method");
     } catch(const std::exception& ex){
         log_error(std::string("rpc handle exception: ")+ex.what());
