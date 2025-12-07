@@ -5993,15 +5993,18 @@ void P2P::loop(){
                         if (used_reverse) { g_hdr_flip[s] = true; }
 
                         if (accepted > 0) {
-                            // PERFORMANCE: Throttle headers logging during sync
-                            static int64_t last_hdr_log_ms = 0;
-                            static uint64_t hdrs_since_log = 0;
+                            // Log headers with peer IP for debugging/security monitoring
+                            // Throttle per-peer to avoid log spam during sync
+                            static std::unordered_map<std::string, int64_t> last_hdr_log_per_peer;
+                            static std::unordered_map<std::string, uint64_t> hdrs_per_peer;
                             int64_t now_hdr_ms = now_ms();
-                            hdrs_since_log += accepted;
-                            if (now_hdr_ms - last_hdr_log_ms > 2000) {  // Log at most every 2 seconds
-                                last_hdr_log_ms = now_hdr_ms;
-                                log_info("P2P: headers accepted=" + std::to_string(hdrs_since_log) + " best_height=" + std::to_string(chain_.best_header_height()));
-                                hdrs_since_log = 0;
+                            hdrs_per_peer[ps.ip] += accepted;
+                            if (now_hdr_ms - last_hdr_log_per_peer[ps.ip] > 2000) {  // Log at most every 2 seconds per peer
+                                last_hdr_log_per_peer[ps.ip] = now_hdr_ms;
+                                log_info("P2P: headers accepted=" + std::to_string(hdrs_per_peer[ps.ip]) +
+                                        " from=" + ps.ip +
+                                        " best_height=" + std::to_string(chain_.best_header_height()));
+                                hdrs_per_peer[ps.ip] = 0;
                             }
                             // CRITICAL FIX: Do NOT update g_last_progress_ms for headers!
                             // We only want to track BLOCK progress for stall detection.
