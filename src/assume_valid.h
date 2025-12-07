@@ -216,6 +216,11 @@ inline const std::vector<Checkpoint>& get_checkpoints() {
         // === MIQROCHAIN OFFICIAL CHECKPOINTS ===
         // These block hashes are from the official chain (seed.miqrochain.org)
         // Any chain not containing these exact blocks will be rejected
+        //
+        // IMPORTANT: To add new checkpoints, run this on your node:
+        //   PowerShell: $hash = (Invoke-RestMethod -Uri "http://127.0.0.1:9834/getblockhash?height=<HEIGHT>").result
+        //   Or use: curl http://127.0.0.1:9834/getblockhash?height=<HEIGHT>
+        //
         {0, "00000000a5e8a7eb02a83fb9693bc2dccbf14ee69d67315c1f151a25cb43fce8"},
         {100, "0000000087059ec4662b4f3cab96644b877c0630bd72d6d09011e18afbe31522"},
         {500, "00000000e3acf7b29053508cdc59842347da357dfb68cd21f3e935474f7914f2"},
@@ -224,6 +229,10 @@ inline const std::vector<Checkpoint>& get_checkpoints() {
         {3000, "0000000006fe4e58f5e351c0ff10d9d685e8f942b44570b5d1d8eea27c00fcc3"},
         {4000, "0000000004911b1ab9eade2eaadca1a72b47be47c27c9cccec39bccf304c71e9"},
         {4255, "00000000050bb0750f9276a0e7bc03a3facdcc5f81d2bf15fce4d894ade27e22"},
+        // === ADD NEW CHECKPOINTS BELOW THIS LINE ===
+        // Run this PowerShell on your node to get block hashes:
+        //   (Invoke-RestMethod -Uri "http://127.0.0.1:9834/getblockhash?height=4300").result
+        // Then add: {4300, "THE_HASH_YOU_GOT"},
     };
     return checkpoints;
 }
