@@ -1593,6 +1593,11 @@ bool Chain::init_genesis(const Block& g){
 
     storage_.append_block(ser_block(g), g.block_hash());
 
+    // CRITICAL FIX: Defensive check for empty transactions to prevent segfault
+    if (g.txs.empty()) {
+        log_error("Genesis block has no transactions - cannot initialize");
+        return false;
+    }
     const auto& cb = g.txs[0];
     uint64_t cb_sum = 0;
     for(size_t i=0;i<cb.vout.size();++i){
@@ -2034,6 +2039,11 @@ bool Chain::disconnect_tip_once(std::string& err){
     }
 
     // Remove coinbase outs and compute sum
+    // CRITICAL FIX: Defensive check for empty transactions to prevent segfault
+    if (cur.txs.empty()) {
+        err = "block has no transactions during disconnect";
+        return false;
+    }
     const auto& cb = cur.txs[0];
     uint64_t cb_sum = 0;
     for (size_t i = 0; i < cb.vout.size(); ++i) {
@@ -2213,6 +2223,11 @@ bool Chain::submit_block(const Block& b, std::string& err){
     }
 
     // coinbase adds + sum
+    // CRITICAL FIX: Defensive check (should never trigger since verify_block checks this)
+    if (b.txs.empty()) {
+        err = "block has no transactions during connect";
+        return false;
+    }
     const auto& cb = b.txs[0];
     uint64_t cb_sum = 0;
     for (size_t i = 0; i < cb.vout.size(); ++i){
