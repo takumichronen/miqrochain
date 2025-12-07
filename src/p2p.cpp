@@ -6006,6 +6006,34 @@ void P2P::loop(){
                                         " best_height=" + std::to_string(chain_.best_header_height()));
                                 hdrs_per_peer[ps.ip] = 0;
                             }
+
+                            // SECURITY: Rate limit headers ONLY after IBD is complete
+                            // During sync we need fast header downloads; after sync excessive headers are suspicious
+                            if (g_logged_headers_done && !ibd_or_fetch_active(ps, now_hdr_ms)) {
+                                static std::unordered_map<std::string, uint64_t> post_ibd_hdr_count;
+                                static std::unordered_map<std::string, int64_t> post_ibd_hdr_window;
+
+                                // Reset window every 60 seconds (generous window)
+                                if (now_hdr_ms - post_ibd_hdr_window[ps.ip] > 60000) {
+                                    post_ibd_hdr_count[ps.ip] = 0;
+                                    post_ibd_hdr_window[ps.ip] = now_hdr_ms;
+                                }
+
+                                post_ibd_hdr_count[ps.ip] += accepted;
+
+                                // After sync, seeing 5000+ headers per minute from one peer is suspicious
+                                // (Normal: new block = ~1 header, reorg = few headers)
+                                if (post_ibd_hdr_count[ps.ip] > 5000) {
+                                    ps.banscore += 10;  // Soft penalty
+                                    log_warn("P2P: excessive headers post-sync from " + ps.ip +
+                                            " count=" + std::to_string(post_ibd_hdr_count[ps.ip]) +
+                                            "/min banscore=" + std::to_string(ps.banscore));
+                                    if (ps.banscore >= MIQ_P2P_MAX_BANSCORE) {
+                                        dead.push_back(s);
+                                        break;
+                                    }
+                                }
+                            }
                             // CRITICAL FIX: Do NOT update g_last_progress_ms for headers!
                             // We only want to track BLOCK progress for stall detection.
                             // Headers can arrive even when blocks are stuck, which would prevent
