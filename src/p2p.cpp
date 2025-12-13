@@ -5197,37 +5197,6 @@ void P2P::loop(){
                 int64_t stall_duration_ms = tnow - g_last_progress_ms;
                 log_info("P2P: stall detected - no height progress for " + std::to_string(stall_duration_ms / 1000) + "s (height=" + std::to_string(h) + ", peers=" + std::to_string(peers_.size()) + ")");
 
-                // AGGRESSIVE FIX: Immediately request the missing block from ALL peers
-                {
-                    uint64_t next_needed = h + 1;
-                    std::vector<uint8_t> block_hash;
-                    if (chain_.get_header_hash_at_height(next_needed, block_hash)) {
-                        // Clear from all tracking to allow fresh request
-                        {
-                            InflightLock lk(g_inflight_lock);
-                            g_global_requested_indices.erase(next_needed);
-                        }
-                        for (auto& kv : g_inflight_index_ts) {
-                            kv.second.erase(next_needed);
-                        }
-
-                        // Request from ALL peers immediately
-                        auto msg = encode_msg("getb", block_hash);
-                        int sent = 0;
-                        for (auto& kvp : peers_) {
-                            if (!kvp.second.verack_ok) continue;
-                            if (send_or_close(kvp.first, msg)) {
-                                sent++;
-                            }
-                        }
-                        log_info("P2P: Stall at " + std::to_string(next_needed) +
-                                 " - broadcast getb to " + std::to_string(sent) + " peers");
-                    } else {
-                        log_info("P2P: Stall at " + std::to_string(next_needed) +
-                                 " - no header available, requesting headers aggressively");
-                    }
-                }
-
                 // Log peer health during stalls (helps diagnose slow peers)
                 if (!g_logged_headers_done) {
                     std::string health_summary;
@@ -5248,25 +5217,23 @@ void P2P::loop(){
                     g_ibd_headers_started_ms > 0 &&
                     (tnow - g_ibd_headers_started_ms) > (int64_t)MIQ_IBD_FALLBACK_AFTER_MS)
                 {
-                    // BITCOIN CORE FIX: No getbi fallback - focus on getting headers faster
-                    // Rate-limit this message to once per 10 seconds
+                    // Rate-limit this message to once per 60 seconds
                     static int64_t last_ibd_fallback_log = 0;
-                    if (tnow - last_ibd_fallback_log > 10000) {
+                    if (tnow - last_ibd_fallback_log > 60000) {
                         last_ibd_fallback_log = tnow;
-                        log_info("[IBD] headers stall detected - requesting headers aggressively from all peers");
+                        log_info("[IBD] headers phase exceeded fallback threshold; enabling index-by-height pipeline on capable peers");
                     }
-                    // Enable syncing for all peers so fill_index_pipeline can use them
-                    // once headers arrive (hash-based requests will work)
                     for (auto &kvp : peers_) {
                         auto &pps = kvp.second;
                         if (!pps.verack_ok) continue;
+                        if (!peer_is_index_capable((Sock)pps.sock)) continue;
                         pps.syncing = true;
+                        pps.inflight_index = 0;
                         pps.next_index = chain_.height() + 1;
-                        // Reset header tracking to allow fresh requests
-                        pps.sent_getheaders = false;
+                        fill_index_pipeline(pps);
                     }
-                    // Reset timer but use shorter interval for faster retry
-                    g_ibd_headers_started_ms = tnow - MIQ_IBD_FALLBACK_AFTER_MS + 500; // Retry in 500ms
+                    // Don’t stop headers; we run both until completion.
+                    g_ibd_headers_started_ms = tnow; // reset timer to avoid spamming
                 }
                 std::vector<std::vector<uint8_t>> locator;
                 chain_.build_locator(locator);
@@ -5304,9 +5271,7 @@ void P2P::loop(){
                     }
                     if (do_send) {
                         (void)send_or_close(sd, flip ? m_f : m_n);
-                        // AGGRESSIVE FIX: Request from ALL peers, not just 2
-                        // When headers stall, we need maximum parallelism
-                        probes++;
+                        if (++probes >= 2) break;
                     }
                 }
 #endif
