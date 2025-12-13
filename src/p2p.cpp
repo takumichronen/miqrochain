@@ -1245,6 +1245,44 @@ static std::atomic<uint64_t> g_max_known_peer_tip{0};
 static std::atomic<bool> g_force_completion_mode{false};
 constexpr uint64_t FORCE_COMPLETION_THRESHOLD = 16;  // Enable when ≤16 blocks behind
 
+// =============================================================================
+// STRICT GAP TRACKING: Fix headers-first → block fetch deadlock
+// Headers can advance far beyond blocks. We must NEVER request blocks beyond
+// chain_.height() + 1 (the first missing height / gap).
+// Only ONE in-flight request per gap is allowed.
+// =============================================================================
+static std::atomic<uint64_t> g_gap_inflight_peer{0};     // Sock of peer fetching gap (0 = none)
+static std::atomic<int64_t>  g_gap_request_time_ms{0};   // When gap was last requested
+static std::atomic<uint64_t> g_gap_index{0};             // The gap index being fetched
+constexpr int64_t GAP_REQUEST_TIMEOUT_MS = 5000;         // 5 seconds before retry
+
+// Track which peer announced each header (prefer them for block fetch)
+static std::unordered_map<uint64_t, Sock> g_header_announcer;
+static std::mutex g_header_announcer_mu;
+
+static inline void set_header_announcer(uint64_t height, Sock peer) {
+    std::lock_guard<std::mutex> lk(g_header_announcer_mu);
+    g_header_announcer[height] = peer;
+    // Prune old entries to prevent unbounded growth
+    if (g_header_announcer.size() > 1000) {
+        // Remove entries more than 500 behind current
+        uint64_t min_keep = (height > 500) ? (height - 500) : 0;
+        for (auto it = g_header_announcer.begin(); it != g_header_announcer.end(); ) {
+            if (it->first < min_keep) {
+                it = g_header_announcer.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+}
+
+static inline Sock get_header_announcer(uint64_t height) {
+    std::lock_guard<std::mutex> lk(g_header_announcer_mu);
+    auto it = g_header_announcer.find(height);
+    return (it != g_header_announcer.end()) ? it->second : MIQ_INVALID_SOCK;
+}
+
 static inline void maybe_mark_headers_done(bool at_tip) {
     if (g_logged_headers_done) return;
     if (!g_logged_headers_started) {
@@ -3569,160 +3607,145 @@ void P2P::start_sync_with_peer(PeerState& ps){
 }
 
 void P2P::fill_index_pipeline(PeerState& ps){
-    // BULLETPROOF SYNC: Fast parallel block downloads
-    // Security is maintained through block hash validation in handle_incoming_block()
-
-    // Use adaptive pipeline size based on peer reputation
-    uint32_t pipe;
-    if (g_sequential_sync) {
-        pipe = 1u;
-    } else {
-        // Update reputation and adaptive batch size
-        update_peer_reputation(ps);
-        update_adaptive_batch_size(ps);
-
-        // Use adaptive batch size, but cap at MIQ_INDEX_PIPELINE
-        pipe = std::min(ps.adaptive_batch_size, (uint32_t)MIQ_INDEX_PIPELINE);
-    }
+    // ==========================================================================
+    // STRICT SEQUENTIAL SYNC: Fix headers-first deadlock
+    // We ONLY request the FIRST MISSING HEIGHT (chain_.height() + 1).
+    // This prevents the deadlock where headers advance but blocks stall at a gap.
+    // ==========================================================================
 
     // peer_is_index_capable is set by start_sync_with_peer
     if (!peer_is_index_capable((Sock)ps.sock)) return;
 
-    // CRITICAL: Don't sync from peers on a different fork!
-    // This prevents wasting bandwidth and getting confused by fork blocks
-    if (ps.fork_detected) {
-        P2P_TRACE("Skipping fill_index_pipeline for forked peer " + ps.ip);
+    // Don't sync from forked or unverified peers
+    if (ps.fork_detected || ps.fork_verification_pending) {
         return;
     }
 
-    // CRITICAL: Don't sync from peers pending fork verification!
-    // We must verify they're on the same chain before downloading blocks
-    if (ps.fork_verification_pending) {
-        P2P_TRACE("Skipping fill_index_pipeline - fork verification pending for " + ps.ip);
-        return;
-    }
-
-    // SYNC STATE FIX: Ensure next_index is consistent with current chain height
     const uint64_t current_height = chain_.height();
-    if (ps.next_index <= current_height) {
-        ps.next_index = current_height + 1;
-        P2P_TRACE("DEBUG: Sync state corrected - next_index updated from " +
-                  std::to_string(ps.next_index - 1) + " to " + std::to_string(ps.next_index) +
-                  " (chain height=" + std::to_string(current_height) + ")");
-    }
-
-    // Backpressure - don't request too far ahead of current tip
-    // This prevents orphan pool overflow when blocks arrive out of order.
-    const uint64_t max_ahead = orphan_count_limit_ / 2;
-    uint64_t max_index = current_height + max_ahead;
-
-    // Determine the limit for block requests from this peer
-    // CRITICAL FIX: Use the MAXIMUM of ALL known chain heights!
-    // This prevents stalls when any single source has a low/wrong value
+    const uint64_t first_missing = current_height + 1;  // THE gap
     const uint64_t best_hdr = chain_.best_header_height();
-    const uint64_t max_peer = g_max_known_peer_tip.load();
-    uint64_t peer_limit;
 
-    // Use MAX of: header height, this peer's tip, global max peer tip
-    // This ensures we NEVER artificially limit requests due to one bad value
-    peer_limit = best_hdr;
-    if (ps.peer_tip_height > peer_limit) {
-        peer_limit = ps.peer_tip_height;
-    }
-    if (max_peer > peer_limit) {
-        peer_limit = max_peer;
-    }
-
-    // Fallback if all sources are 0 - use aggressive window
-    if (peer_limit == 0) {
-        peer_limit = current_height + max_ahead;
+    // Nothing to sync if we're at header tip
+    if (first_missing > best_hdr) {
+        return;
     }
 
     // Don't request from peers that are clearly behind us
-    // But use a generous margin - peer might still have some blocks
-    if (peer_limit + 100 < current_height) {
-        P2P_TRACE("DEBUG: Skipping block requests from " + ps.ip +
-                  " - peer_limit=" + std::to_string(peer_limit) +
-                  " our_height=" + std::to_string(current_height));
+    if (ps.peer_tip_height > 0 && ps.peer_tip_height < first_missing) {
         return;
     }
 
-    max_index = std::min(max_index, peer_limit);
+    // Check if we already have this block in pending
+    if (pending_blocks_.find(first_missing) != pending_blocks_.end()) {
+        // Block is already received, waiting to be processed
+        return;
+    }
 
-    while (ps.inflight_index < pipe) {
-        uint64_t idx = ps.next_index;
+    // =========================================================================
+    // SINGLE IN-FLIGHT REQUEST PER GAP
+    // Only ONE request for the gap block at a time. If it's already in-flight,
+    // check for timeout before retrying.
+    // =========================================================================
+    const int64_t tnow = now_ms();
+    const uint64_t inflight_peer = g_gap_inflight_peer.load(std::memory_order_acquire);
+    const uint64_t inflight_idx = g_gap_index.load(std::memory_order_acquire);
+    const int64_t req_time = g_gap_request_time_ms.load(std::memory_order_acquire);
 
-        // Backpressure: Stop if we're too far ahead of the tip or beyond header height
-        if (idx > max_index) {
-            // Don't request more - wait for chain/headers to catch up
-            break;
+    // Is there already an in-flight request for this exact gap?
+    if (inflight_idx == first_missing && inflight_peer != 0) {
+        // Check timeout
+        if (tnow - req_time < GAP_REQUEST_TIMEOUT_MS) {
+            // Request still pending, don't send another
+            return;
         }
+        // Timeout - clear and retry from a different peer
+        log_warn("[SYNC] Gap request timeout for block " + std::to_string(first_missing) +
+                 " after " + std::to_string(tnow - req_time) + "ms");
+        g_gap_inflight_peer.store(0, std::memory_order_release);
+    }
 
-        // BULLETPROOF SYNC: Skip if this index is already being requested by another peer
-        // This prevents duplicate requests that waste bandwidth and create duplicate orphans
-        // FORCE-COMPLETION: In force mode, allow duplicate requests for faster completion
+    // =========================================================================
+    // PREFER HEADER ANNOUNCER for block fetch
+    // The peer that announced the header is most likely to have the block.
+    // =========================================================================
+    Sock preferred = get_header_announcer(first_missing);
+    if (preferred != MIQ_INVALID_SOCK && preferred != (Sock)ps.sock) {
+        // A different peer announced this header - prefer them
+        auto it = peers_.find(preferred);
+        if (it != peers_.end() && it->second.verack_ok &&
+            !it->second.fork_detected && !it->second.fork_verification_pending) {
+            // Preferred peer is available - let them handle it
+            return;
+        }
+        // Preferred peer unavailable, continue with current peer
+    }
+
+    // =========================================================================
+    // SEND THE REQUEST for the first missing block
+    // =========================================================================
+    uint8_t p[8];
+    for (int i = 0; i < 8; i++) {
+        p[i] = (uint8_t)((first_missing >> (8 * i)) & 0xFF);
+    }
+    auto msg = encode_msg("getbi", std::vector<uint8_t>(p, p + 8));
+    if (send_or_close(ps.sock, msg)) {
+        // Mark as in-flight
+        g_gap_index.store(first_missing, std::memory_order_release);
+        g_gap_inflight_peer.store((uint64_t)ps.sock, std::memory_order_release);
+        g_gap_request_time_ms.store(tnow, std::memory_order_release);
+
+        // Also update per-peer tracking for compatibility
+        g_inflight_index_ts[(Sock)ps.sock][first_missing] = tnow;
+        g_inflight_index_order[(Sock)ps.sock].push_back(first_missing);
         {
             InflightLock lk(g_inflight_lock);
-            const bool force_mode = g_force_completion_mode.load(std::memory_order_relaxed);
-            if (!force_mode && g_global_requested_indices.count(idx)) {
-                // Another peer is already fetching this index, skip to next
-                ps.next_index++;
-                continue;
-            }
+            g_global_requested_indices.insert(first_missing);
         }
+        ps.inflight_index++;
+        ps.next_index = first_missing + 1;
 
-        // Check if we should skip this index (already have it or exceeds limits)
-        // These are NOT errors - just skip to next index
-        // CRITICAL FIX: Only stop at header height if we're TRULY done with headers
-        // Use g_max_known_peer_tip as a sanity check to avoid stopping too early
-        const uint64_t hdr_height = chain_.best_header_height();
-        const uint64_t max_tip = g_max_known_peer_tip.load();
-        if (g_logged_headers_done && hdr_height > 0 && idx > hdr_height) {
-            // Only stop if header height >= max peer tip (we're truly at the tip)
-            // Otherwise, headers might not have fully synced yet
-            if (max_tip == 0 || hdr_height >= max_tip) {
-                break;
-            }
-            // Headers not fully synced - continue requesting up to max_tip
-        }
-        if (idx <= chain_.height()) {
-            // Already have this block - skip to next
-            ps.next_index++;
-            continue;
-        }
-
-        // Actually send the request
-        if (request_block_index(ps, idx)) {
-            ps.next_index++;
-            ps.inflight_index++;
-        } else {
-            // Send failed - stop requesting from this peer (socket issue)
-            break;
-        }
+        P2P_TRACE("[SYNC] Requested gap block " + std::to_string(first_missing) +
+                  " from " + ps.ip + " (headers at " + std::to_string(best_hdr) + ")");
     }
+
+    // NOTE: We do NOT loop to request more blocks.
+    // Only ONE block (the first missing) is requested per peer per call.
+    // This ensures strict sequential ordering and prevents the deadlock.
 }
 
 bool P2P::request_block_index(PeerState& ps, uint64_t index){
-    // PERFORMANCE: During IBD, allow requesting beyond header height for parallel sync
-    // Blocks will be validated when headers catch up - they wait in orphan pool
-    // Only enforce header cap AFTER headers phase is complete
-    const uint64_t hdr_height = chain_.best_header_height();
-    const uint64_t max_tip = g_max_known_peer_tip.load();
-    if (g_logged_headers_done && hdr_height > 0 && index > hdr_height) {
-        // CRITICAL FIX: Only block if headers are truly complete
-        // If max_peer_tip > hdr_height, headers haven't fully synced yet
-        if (max_tip == 0 || hdr_height >= max_tip) {
-            P2P_TRACE("BLOCKED: request_block_index(" + std::to_string(index) +
-                      ") exceeds header height " + std::to_string(hdr_height));
-            return false;
-        }
-        // Allow request - headers are incomplete
+    // ==========================================================================
+    // STRICT GAP ENFORCEMENT: Only allow requests for chain_.height() + 1
+    // This prevents requesting blocks beyond the first missing height.
+    // ==========================================================================
+    const uint64_t current_height = chain_.height();
+    const uint64_t first_missing = current_height + 1;
+
+    // STRICT: Reject any request that's not for the first missing block
+    if (index != first_missing) {
+        P2P_TRACE("BLOCKED: request_block_index(" + std::to_string(index) +
+                  ") - must request first missing " + std::to_string(first_missing));
+        return false;
     }
 
-    // Also don't request blocks we already have
-    if (index <= chain_.height()) {
-        P2P_TRACE("SKIP: request_block_index(" + std::to_string(index) +
-                  ") - already have this block");
+    // Don't request beyond header height
+    const uint64_t hdr_height = chain_.best_header_height();
+    if (index > hdr_height) {
+        P2P_TRACE("BLOCKED: request_block_index(" + std::to_string(index) +
+                  ") exceeds header height " + std::to_string(hdr_height));
+        return false;
+    }
+
+    // Already have this block
+    if (index <= current_height) {
+        return false;
+    }
+
+    // Check single in-flight constraint
+    const uint64_t inflight_peer = g_gap_inflight_peer.load(std::memory_order_acquire);
+    const uint64_t inflight_idx = g_gap_index.load(std::memory_order_acquire);
+    if (inflight_idx == index && inflight_peer != 0) {
+        // Already in-flight
         return false;
     }
 
@@ -3732,11 +3755,16 @@ bool P2P::request_block_index(PeerState& ps, uint64_t index){
     }
     auto msg = encode_msg("getbi", std::vector<uint8_t>(p, p + 8));
     if (send_or_close(ps.sock, msg)) {
-        // Track inflight timestamp and ordering per-peer for oldest-first retries
-        g_inflight_index_ts[(Sock)ps.sock][index] = now_ms();
-        g_inflight_index_order[(Sock)ps.sock].push_back(index);
+        const int64_t tnow = now_ms();
 
-        // BULLETPROOF SYNC: Mark this index as globally requested
+        // Mark as the single in-flight gap request
+        g_gap_index.store(index, std::memory_order_release);
+        g_gap_inflight_peer.store((uint64_t)ps.sock, std::memory_order_release);
+        g_gap_request_time_ms.store(tnow, std::memory_order_release);
+
+        // Also update per-peer tracking for compatibility
+        g_inflight_index_ts[(Sock)ps.sock][index] = tnow;
+        g_inflight_index_order[(Sock)ps.sock].push_back(index);
         {
             InflightLock lk(g_inflight_lock);
             g_global_requested_indices.insert(index);
@@ -4103,6 +4131,14 @@ void P2P::queue_block_by_height(uint64_t height, const std::vector<uint8_t>& has
 
     pending_blocks_[height] = std::move(pb);
     pending_blocks_bytes_ += raw.size();
+
+    // CRITICAL FIX: Clear gap tracking when we receive the gap block
+    // This allows the next block to be requested immediately
+    if (g_gap_index.load(std::memory_order_acquire) == height) {
+        g_gap_inflight_peer.store(0, std::memory_order_release);
+        g_gap_index.store(0, std::memory_order_release);
+        g_gap_request_time_ms.store(0, std::memory_order_release);
+    }
 
     // Evict old blocks if queue is too large
     evict_pending_blocks_if_needed();
@@ -5883,109 +5919,54 @@ void P2P::loop(){
           }
 
           // ========================================================================
-          // CRITICAL FIX: Gap Detection and Re-request
-          // If we have blocks at height N+2, N+3 but not N+1, detect and re-request N+1
-          // This handles cases where a block request was lost or peer disconnected
-          // Run every 500ms (was 2s) for FAST recovery from stalls!
+          // SIMPLIFIED GAP RECOVERY: Uses strict sequential sync
+          // fill_index_pipeline now handles all gap requests. This section just
+          // clears stale tracking and triggers fill_index_pipeline for each peer.
           // ========================================================================
           {
               static int64_t last_gap_check_ms = 0;
-              static uint64_t last_gap_index = 0;
-              static int gap_request_count = 0;
               const int64_t tnow = now_ms();
 
-              if (tnow - last_gap_check_ms > 500) {  // Every 500ms - FAST GAP RECOVERY
+              if (tnow - last_gap_check_ms > 500) {  // Every 500ms
                   last_gap_check_ms = tnow;
 
                   const uint64_t current_height = chain_.height();
-                  const uint64_t next_needed = current_height + 1;
+                  const uint64_t first_missing = current_height + 1;
                   const uint64_t header_height = chain_.best_header_height();
 
-                  // Only check for gaps if we're behind header tip
+                  // Only check if we're behind header tip
                   if (header_height > 0 && current_height < header_height) {
                       // Check if we're missing the next block
-                      bool have_next = pending_blocks_.find(next_needed) != pending_blocks_.end();
+                      bool have_next = pending_blocks_.find(first_missing) != pending_blocks_.end();
 
                       if (!have_next) {
-                          // Reset counter if gap index changed
-                          if (next_needed != last_gap_index) {
-                              last_gap_index = next_needed;
-                              gap_request_count = 0;
-                          }
+                          // Check if gap request timed out
+                          const uint64_t inflight_idx = g_gap_index.load(std::memory_order_acquire);
+                          const int64_t req_time = g_gap_request_time_ms.load(std::memory_order_acquire);
 
-                          // AGGRESSIVE: Clear global tracking and force re-request
-                          // After 3 failed attempts (6 seconds), request from ALL peers
-                          gap_request_count++;
+                          if (inflight_idx == first_missing && (tnow - req_time) > GAP_REQUEST_TIMEOUT_MS) {
+                              // Timeout - clear tracking and let fill_index_pipeline retry
+                              log_warn("[SYNC] Gap block " + std::to_string(first_missing) +
+                                       " timed out - clearing for retry");
+                              g_gap_inflight_peer.store(0, std::memory_order_release);
+                              g_gap_index.store(0, std::memory_order_release);
 
-                          // Clear from global tracking to allow fresh request
-                          {
-                              InflightLock lk(g_inflight_lock);
-                              g_global_requested_indices.erase(next_needed);
-                          }
-
-                          // Also clear from all peer tracking
-                          for (auto& kv : g_inflight_index_ts) {
-                              kv.second.erase(next_needed);
-                          }
-                          for (auto& kv : g_inflight_index_order) {
-                              auto& dq = kv.second;
-                              dq.erase(std::remove(dq.begin(), dq.end(), next_needed), dq.end());
-                          }
-
-                          if (gap_request_count <= 3) {
-                              // First 3 attempts: request from best peer
-                              log_warn("P2P: Gap at index " + std::to_string(next_needed) +
-                                       " (attempt " + std::to_string(gap_request_count) + "/3)");
-
-                              Sock target = MIQ_INVALID_SOCK;
-                              double best_score = -1.0;
-                              for (auto& kvp : peers_) {
-                                  if (!kvp.second.verack_ok) continue;
-                                  if (kvp.second.health_score > best_score) {
-                                      best_score = kvp.second.health_score;
-                                      target = kvp.first;
-                                  }
+                              // Clear from old tracking for compatibility
+                              {
+                                  InflightLock lk(g_inflight_lock);
+                                  g_global_requested_indices.erase(first_missing);
                               }
-                              if (target != MIQ_INVALID_SOCK) {
-                                  auto itT = peers_.find(target);
-                                  if (itT != peers_.end()) {
-                                      uint8_t p8[8];
-                                      for (int i = 0; i < 8; i++) p8[i] = (uint8_t)((next_needed >> (8 * i)) & 0xFF);
-                                      auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
-                                      if (send_or_close(target, msg)) {
-                                          g_inflight_index_ts[target][next_needed] = tnow;
-                                          g_inflight_index_order[target].push_back(next_needed);
-                                          {
-                                              InflightLock lk(g_inflight_lock);
-                                              g_global_requested_indices.insert(next_needed);
-                                          }
-                                          itT->second.inflight_index++;
-                                          log_info("P2P: Re-requested gap block " + std::to_string(next_needed) +
-                                                   " from " + itT->second.ip);
-                                      }
-                                  }
+                              for (auto& kv : g_inflight_index_ts) {
+                                  kv.second.erase(first_missing);
                               }
-                          } else {
-                              // After 3 attempts: BROADCAST to ALL peers
-                              log_warn("P2P: Gap at index " + std::to_string(next_needed) +
-                                       " - broadcasting to ALL peers!");
+                          }
 
-                              int sent_count = 0;
-                              for (auto& kvp : peers_) {
-                                  if (!kvp.second.verack_ok) continue;
-
-                                  uint8_t p8[8];
-                                  for (int i = 0; i < 8; i++) p8[i] = (uint8_t)((next_needed >> (8 * i)) & 0xFF);
-                                  auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
-                                  if (send_or_close(kvp.first, msg)) {
-                                      sent_count++;
-                                  }
+                          // Trigger fill_index_pipeline for all syncing peers
+                          // This will pick the best peer and request the gap block
+                          for (auto& kvp : peers_) {
+                              if (kvp.second.verack_ok && kvp.second.syncing) {
+                                  fill_index_pipeline(kvp.second);
                               }
-                              log_info("P2P: Broadcast getbi(" + std::to_string(next_needed) +
-                                       ") to " + std::to_string(sent_count) + " peers");
-
-                              // Reset counter to avoid spamming
-                              gap_request_count = 0;
                           }
                       }
                   }
@@ -7521,6 +7502,7 @@ void P2P::loop(){
                         size_t accepted = 0;
                         bool used_reverse = false;
                         std::string herr;
+                        uint64_t hdr_height_before = chain_.best_header_height();
                         for (const auto& h : hs) {
                             if (chain_.accept_header(h, herr)) {
                                 accepted++;
@@ -7536,6 +7518,15 @@ void P2P::loop(){
                             }
                         }
                         if (used_reverse) { g_hdr_flip[s] = true; }
+
+                        // CRITICAL FIX: Track which peer announced these headers
+                        // Used by fill_index_pipeline to prefer this peer for block fetch
+                        if (accepted > 0) {
+                            uint64_t hdr_height_after = chain_.best_header_height();
+                            for (uint64_t h = hdr_height_before + 1; h <= hdr_height_after; ++h) {
+                                set_header_announcer(h, s);
+                            }
+                        }
 
                         if (accepted > 0) {
                             // PERFORMANCE: Throttle headers logging during sync
@@ -7707,7 +7698,8 @@ void P2P::loop(){
                             for (int j=0;j<8;j++) idx64 |= ((uint64_t)m.payload[j]) << (8*j);
                             P2P_TRACE("DEBUG: getbi request for index " + std::to_string(idx64) + " from " + ps.ip);
 
-                            // DIAGNOSTIC: Log getbi requests that might fail
+                            // CRITICAL FIX: Do NOT serve blocks beyond our local tip
+                            // This prevents peers from requesting blocks we don't have
                             uint64_t our_height = chain_.height();
                             if (idx64 > our_height) {
                                 // Rate-limit this log to prevent spam
@@ -7717,11 +7709,14 @@ void P2P::loop(){
                                 future_req_count.fetch_add(1, std::memory_order_relaxed);
                                 if (tnow - last_future_log_ms.load(std::memory_order_relaxed) > 5000) {
                                     int cnt = future_req_count.exchange(0, std::memory_order_relaxed);
-                                    log_warn("P2P: Peer " + ps.ip + " requested block " + std::to_string(idx64) +
-                                             " but our height is only " + std::to_string(our_height) +
-                                             " (count=" + std::to_string(cnt) + " requests beyond tip)");
+                                    log_warn("P2P: REJECTED getbi(" + std::to_string(idx64) +
+                                             ") from " + ps.ip + " - our height is only " +
+                                             std::to_string(our_height) + " (" + std::to_string(cnt) + " rejected)");
                                     last_future_log_ms.store(tnow, std::memory_order_relaxed);
                                 }
+                                // Send notfound immediately - we don't have this block
+                                send_notfound_index(s, idx64);
+                                continue;  // Don't try to serve, skip to next message
                             }
 
                             Block b;
@@ -8526,6 +8521,7 @@ void P2P::loop(){
                         size_t accepted = 0;
                         bool   used_reverse = false;
                         std::string herr;
+                        uint64_t hdr_height_before = chain_.best_header_height();
                         for (const auto& h : hs) {
                             if (chain_.accept_header(h, herr)) {
                                 accepted++;
@@ -8541,6 +8537,14 @@ void P2P::loop(){
                             }
                         }
                         if (used_reverse) { g_hdr_flip[s] = true; }
+
+                        // CRITICAL FIX: Track which peer announced these headers
+                        if (accepted > 0) {
+                            uint64_t hdr_height_after = chain_.best_header_height();
+                            for (uint64_t hh = hdr_height_before + 1; hh <= hdr_height_after; ++hh) {
+                                set_header_announcer(hh, s);
+                            }
+                        }
 
                         if (hs.empty() || accepted == 0) {
                             int &zero_count = g_zero_hdr_batches[s];
