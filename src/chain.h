@@ -172,6 +172,14 @@ private:
     // Orphan raw blocks keyed by block-hash (hk)
     std::unordered_map<std::string, std::vector<uint8_t>> orphan_blocks_;
 
+    // BITCOIN CORE FIX: Orphan headers storage
+    // When a header arrives with unknown parent, store it here keyed by parent hash.
+    // When the parent arrives, process orphan children. This ensures headers
+    // arriving out of order are not lost.
+    // Key: hk(parent_hash), Value: list of headers waiting for that parent
+    std::unordered_map<std::string, std::vector<BlockHeader>> orphan_headers_by_parent_;
+    static constexpr size_t MAX_ORPHAN_HEADERS = 10000;  // Limit memory usage
+
     // Map child->parent for walking up the header tree
     inline static std::string keyh(const std::vector<uint8_t>& h) {
         return std::string(reinterpret_cast<const char*>(h.data()), h.size());
