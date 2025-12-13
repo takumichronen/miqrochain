@@ -5645,6 +5645,38 @@ void P2P::loop(){
                            ": hdr=" + std::to_string(header_height) +
                            " peer=" + std::to_string(max_peer) + "] - recovering");
 
+                  // FORK DIAGNOSTIC: Log recent block hashes for manual comparison with seed
+                  // Run once per stall to help identify if we're on a fork
+                  static int64_t last_fork_diag_ms = 0;
+                  if (tnow - last_fork_diag_ms > 30000) {  // Once per 30 seconds max
+                      last_fork_diag_ms = tnow;
+                      log_info("=== FORK DIAGNOSTIC: Compare these hashes with seed node ===");
+                      // Log hashes at: tip, tip-5, tip-10, and last checkpoint
+                      std::vector<uint64_t> check_heights;
+                      if (chain_height > 0) check_heights.push_back(chain_height);
+                      if (chain_height > 5) check_heights.push_back(chain_height - 5);
+                      if (chain_height > 10) check_heights.push_back(chain_height - 10);
+                      // Add last checkpoint for reference
+                      uint64_t last_cp = miq::get_highest_checkpoint_height();
+                      if (last_cp > 0 && last_cp <= chain_height) {
+                          check_heights.push_back(last_cp);
+                      }
+                      for (uint64_t h : check_heights) {
+                          Block b;
+                          if (chain_.get_block_by_index(h, b)) {
+                              auto hash = b.block_hash();
+                              std::string hash_hex;
+                              for (auto byte : hash) {
+                                  char buf[3];
+                                  snprintf(buf, 3, "%02x", byte);
+                                  hash_hex += buf;
+                              }
+                              log_info("  Height " + std::to_string(h) + ": " + hash_hex);
+                          }
+                      }
+                      log_info("=== Run 'getblockhash <height>' on seed to compare ===");
+                  }
+
                   // CRITICAL FIX: Clear ALL global requested indices above current height
                   // This handles orphaned indices that got stuck without per-peer tracking
                   // Without this, fill_index_pipeline skips them forever!
