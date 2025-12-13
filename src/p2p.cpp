@@ -6958,6 +6958,24 @@ void P2P::loop(){
                 g_preverack_counts.erase(s_dead);
                 g_trickle_last_ms.erase(s_dead);
                 g_cmd_rl.erase(s_dead);
+
+                // CRITICAL FIX: Recalculate g_max_known_peer_tip from remaining peers
+                // Without this, a stale max tip from a disconnected peer causes sync stalls
+                // (node keeps trying to reach height that no remaining peer has)
+                {
+                    uint64_t new_max = 0;
+                    for (const auto& kvp : peers_) {
+                        if (kvp.second.peer_tip_height > new_max) {
+                            new_max = kvp.second.peer_tip_height;
+                        }
+                    }
+                    uint64_t old_max = g_max_known_peer_tip.load();
+                    if (new_max < old_max) {
+                        g_max_known_peer_tip.store(new_max);
+                        log_info("P2P: Recalculated max peer tip after disconnect: " +
+                                 std::to_string(old_max) + " -> " + std::to_string(new_max));
+                    }
+                }
             }
             // we handled the closes ourselves; do not let them be processed elsewhere this tick
             dead.clear();
@@ -7777,6 +7795,21 @@ void P2P::loop(){
                                 ps.peer_tip_reduced_ms = now_ms();
                                 P2P_TRACE("P2P: Peer " + ps.ip + " tip reduced to " + std::to_string(ps.peer_tip_height) +
                                           " (was at exact tip)");
+
+                                // CRITICAL FIX: Recalculate g_max_known_peer_tip when peer tip reduced
+                                // This prevents stale targets from causing sync stalls
+                                uint64_t new_max = 0;
+                                for (const auto& kvp : peers_) {
+                                    if (kvp.second.peer_tip_height > new_max) {
+                                        new_max = kvp.second.peer_tip_height;
+                                    }
+                                }
+                                uint64_t old_max = g_max_known_peer_tip.load();
+                                if (new_max < old_max) {
+                                    g_max_known_peer_tip.store(new_max);
+                                    log_info("P2P: Reduced max peer tip after notfound: " +
+                                             std::to_string(old_max) + " -> " + std::to_string(new_max));
+                                }
                             } else {
                                 // Don't reduce - peer just doesn't have this specific block
                                 // Track that we asked and failed, so we don't ask again immediately
@@ -7849,6 +7882,18 @@ void P2P::loop(){
                                     // No alternative peer available - this block might not be available yet
                                     log_warn("P2P: No alternative peer for index " + std::to_string(idx64) +
                                              " - all peers may be behind");
+
+                                    // CRITICAL FIX: If NO peer can serve this block, reduce max peer tip
+                                    // The target was likely from a disconnected peer or incorrect announcement
+                                    uint64_t old_max = g_max_known_peer_tip.load();
+                                    if (idx64 <= old_max && idx64 > 0) {
+                                        // Reduce max tip to just below this unreachable block
+                                        uint64_t new_max = idx64 - 1;
+                                        g_max_known_peer_tip.store(new_max);
+                                        log_info("P2P: Reduced max peer tip (no peer has block " +
+                                                 std::to_string(idx64) + "): " +
+                                                 std::to_string(old_max) + " -> " + std::to_string(new_max));
+                                    }
                                 }
                             }
 
