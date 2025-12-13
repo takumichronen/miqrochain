@@ -5228,7 +5228,7 @@ void P2P::loop(){
                         if (!pps.verack_ok) continue;
                         if (!peer_is_index_capable((Sock)pps.sock)) continue;
                         pps.syncing = true;
-                        pps.inflight_index = 0;
+                        // BITCOIN CORE FIX: Do NOT reset inflight_index - may have outstanding requests
                         pps.next_index = chain_.height() + 1;
                         fill_index_pipeline(pps);
                     }
@@ -5652,7 +5652,6 @@ void P2P::loop(){
               g_peer_index_capable[s] = false;
               auto &ps = kvp.second;
               ps.syncing = false;
-              ps.inflight_index = 0;
 
               // BULLETPROOF SYNC: Clear global index tracking when peer is demoted
               // This prevents indices from getting stuck in the global set
@@ -5667,6 +5666,8 @@ void P2P::loop(){
               }
               g_inflight_index_ts.erase(s);
               g_inflight_index_order.erase(s);
+              // BITCOIN CORE FIX: Reset inflight_index AFTER clearing tracking
+              ps.inflight_index = 0;
 
               // CRITICAL FIX: Reset peer_tip_height when peer is demoted due to timeouts
               // This prevents peer_tip_height from being stuck at incorrect values
@@ -5716,7 +5717,7 @@ void P2P::loop(){
                           g_peer_index_capable[s] = true;
                           g_index_timeouts[s] = 0;  // Reset timeout counter
                           kvp.second.syncing = true;
-                          kvp.second.inflight_index = 0;
+                          // BITCOIN CORE FIX: Do NOT reset inflight_index - may have outstanding requests
                           kvp.second.next_index = chain_.height() + 1;
                           // CRITICAL FIX: Actually start requesting blocks after re-enabling
                           // Without this, the peer is marked as syncing but no requests are made
@@ -5775,7 +5776,7 @@ void P2P::loop(){
                           // Ensure peer is syncing
                           if (!kvp.second.syncing) {
                               kvp.second.syncing = true;
-                              kvp.second.inflight_index = 0;
+                              // BITCOIN CORE FIX: Do NOT reset inflight_index
                               kvp.second.next_index = chain_height + 1;
                           }
 
@@ -5803,7 +5804,7 @@ void P2P::loop(){
                   // Force activate and refill for all capable peers
                   if (!kvp.second.syncing) {
                       kvp.second.syncing = true;
-                      kvp.second.inflight_index = 0;
+                      // BITCOIN CORE FIX: Do NOT reset inflight_index
                       kvp.second.next_index = chain_.height() + 1;
                   }
                   fill_index_pipeline(kvp.second);
@@ -5876,7 +5877,7 @@ void P2P::loop(){
 
                       // Reset sync state
                       kvp.second.syncing = true;
-                      kvp.second.inflight_index = 0;
+                      // BITCOIN CORE FIX: Do NOT reset inflight_index
                       kvp.second.next_index = chain_height + 1;
 
                       // Clear per-peer inflight tracking
@@ -6110,7 +6111,7 @@ void P2P::loop(){
                           g_peer_index_capable[s] = true;
                           g_index_timeouts[s] = 0;
                           kvp.second.syncing = true;
-                          kvp.second.inflight_index = 0;
+                          // BITCOIN CORE FIX: Do NOT reset inflight_index
                           kvp.second.next_index = chain_height + 1;
                           // Fill pipeline
                           fill_index_pipeline(kvp.second);
@@ -6710,7 +6711,7 @@ void P2P::loop(){
 
                             g_peer_index_capable[(Sock)pps.sock] = true;
                             pps.syncing = true;
-                            pps.inflight_index = 0;
+                            // BITCOIN CORE FIX: Do NOT reset inflight_index
                             pps.next_index = chain_.height() + 1;
                             fill_index_pipeline(pps);
                         }
@@ -6792,7 +6793,7 @@ void P2P::loop(){
                     // Mark peer as index-capable and start block sync
                     g_peer_index_capable[(Sock)pps.sock] = true;
                     pps.syncing = true;
-                    pps.inflight_index = 0;
+                    // BITCOIN CORE FIX: Do NOT reset inflight_index
                     pps.next_index = chain_.height() + 1;
                     fill_index_pipeline(pps);
                     log_info("[IBD] Started block sync with " + pps.ip +
@@ -6862,7 +6863,7 @@ void P2P::loop(){
                             // Force activate and refill pipeline
                             if (!pps.syncing) {
                                 pps.syncing = true;
-                                pps.inflight_index = 0;
+                                // BITCOIN CORE FIX: Do NOT reset inflight_index
                                 pps.next_index = current_height + 1;
                             }
                             fill_index_pipeline(pps);
@@ -6991,7 +6992,7 @@ void P2P::loop(){
 
                         if (!pps.syncing) {
                             pps.syncing = true;
-                            pps.inflight_index = 0;
+                            // BITCOIN CORE FIX: Do NOT reset inflight_index
                             pps.next_index = current_height + 1;
                             fill_index_pipeline(pps);
                         }
@@ -7030,7 +7031,7 @@ void P2P::loop(){
                         // causing the stop-start sync pattern
                         if (!pps.syncing) {
                             pps.syncing = true;
-                            pps.inflight_index = 0;
+                            // BITCOIN CORE FIX: Do NOT reset inflight_index
                             pps.next_index = current_height + 1;
                         }
                         fill_index_pipeline(pps);
@@ -7102,7 +7103,7 @@ void P2P::loop(){
 
                         // Always reset and reactivate to ensure fresh sync
                         pps.syncing = true;
-                        pps.inflight_index = 0;
+                        // BITCOIN CORE FIX: Do NOT reset inflight_index
                         pps.next_index = chain_.height() + 1;
                         fill_index_pipeline(pps);
                         activated_peers++;
@@ -7835,8 +7836,8 @@ void P2P::loop(){
 #endif
                         {
                             ps.syncing = true;
-                            ps.inflight_index = 0;
-                            ps.next_index = chain_.height() + 1;  
+                            // BITCOIN CORE FIX: Do NOT reset inflight_index
+                            ps.next_index = chain_.height() + 1;
                             fill_index_pipeline(ps);
                         }
 
@@ -8218,7 +8219,7 @@ void P2P::loop(){
                                     g_index_timeouts[(Sock)s] = 0;  // Reset timeout counter
                                     if (!ps.syncing) {
                                         ps.syncing = true;
-                                        ps.inflight_index = 0;
+                                        // BITCOIN CORE FIX: Do NOT reset inflight_index
                                         ps.next_index = chain_.height() + 1;
                                         log_info("P2P: Re-enabled sync on " + ps.ip + " after receiving extended headers");
                                     }
@@ -8307,7 +8308,7 @@ void P2P::loop(){
                             }
                             if (!ps.syncing) {
                                 ps.syncing = true;
-                                ps.inflight_index = 0;
+                                // BITCOIN CORE FIX: Do NOT reset inflight_index
                                 ps.next_index = chain_.height() + 1;
                             }
                             fill_index_pipeline(ps);
@@ -9335,7 +9336,7 @@ void P2P::loop(){
                                 // CRITICAL: Mark peer as index-capable and enable fallback
                                 g_peer_index_capable[(Sock)s] = true;
                                 ps.syncing = true;
-                                ps.inflight_index = 0;
+                                // BITCOIN CORE FIX: Do NOT reset inflight_index
                                 ps.next_index = chain_.height() + 1;
                                 fill_index_pipeline(ps);
                                 log_warn("P2P: headers made no progress repeatedly from " + ps.ip +
@@ -9373,7 +9374,7 @@ void P2P::loop(){
                                     // CRITICAL: Mark peer as index-capable for fallback to work
                                     g_peer_index_capable[(Sock)s] = true;
                                     ps.syncing = true;
-                                    ps.inflight_index = 0;
+                                    // BITCOIN CORE FIX: Do NOT reset inflight_index
                                     ps.next_index = chain_.height() + 1;
                                     fill_index_pipeline(ps);
                                     zero_count = 0;
@@ -9404,7 +9405,7 @@ void P2P::loop(){
                                     // Otherwise fill_index_pipeline returns early and fallback doesn't work!
                                     g_peer_index_capable[(Sock)ps.sock] = true;
                                     ps.syncing = true;
-                                    ps.inflight_index = 0;
+                                    // BITCOIN CORE FIX: Do NOT reset inflight_index
                                     ps.next_index = chain_.height() + 1;
                                     fill_index_pipeline(ps);
                                 }
@@ -9618,6 +9619,8 @@ void P2P::loop(){
                         // Clear this peer's inflight tracking and restart
                         g_inflight_index_ts.erase((Sock)s);
                         g_inflight_index_order.erase((Sock)s);
+                        // BITCOIN CORE FIX: Reset inflight_index ONLY when we clear tracking
+                        // This is the one legitimate case - we just cleared all inflight state
                         ps.inflight_index = 0;
                         ps.next_index = chain_.height() + 1;
                         fill_index_pipeline(ps);
@@ -9701,7 +9704,7 @@ void P2P::loop(){
                     // CRITICAL: Mark peer as index-capable for fallback to work
                     g_peer_index_capable[(Sock)s] = true;
                     ps.syncing = true;
-                    ps.inflight_index = 0;
+                    // BITCOIN CORE FIX: Do NOT reset inflight_index
                     ps.next_index = chain_.height() + 1;
                     fill_index_pipeline(ps);
                 }

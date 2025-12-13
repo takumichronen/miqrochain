@@ -805,12 +805,39 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
         }
     }
 
-    // CRITICAL FIX: If we can't find the parent, reject the header
-    // This prevents headers from being assigned wrong heights (e.g., height=1)
-    // which would corrupt the chain state
+    // BITCOIN CORE FIX: If we can't find the parent, store as orphan instead of rejecting
+    // Headers can arrive out of order. Rejecting them means they're lost forever
+    // and the node will never sync. Store them and process when parent arrives.
     if (!found_parent) {
-        err = "cannot compute height - parent not in header index";
-        return false;
+        std::string parent_key = hk(h.prev_hash);
+
+        // Check memory limit
+        size_t total_orphans = 0;
+        for (const auto& kv : orphan_headers_by_parent_) {
+            total_orphans += kv.second.size();
+        }
+
+        if (total_orphans < MAX_ORPHAN_HEADERS) {
+            // Check if we already have this orphan stored
+            auto& orphan_list = orphan_headers_by_parent_[parent_key];
+            bool already_stored = false;
+            for (const auto& existing : orphan_list) {
+                if (header_hash_of(existing) == hh) {
+                    already_stored = true;
+                    break;
+                }
+            }
+
+            if (!already_stored) {
+                orphan_list.push_back(h);
+                // Don't spam logs - this is expected during fast sync
+            }
+        }
+
+        // Return success - we didn't reject the header, we stored it
+        // The caller shouldn't retry sending this header
+        err = "";  // Clear error - this is not an error condition
+        return true;
     }
 
     m.height   = parent_height + 1;
@@ -825,6 +852,21 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
 
     header_index_.emplace(key, std::move(m));
     set_header_full(key, h);  // THREAD-SAFE
+
+    // BITCOIN CORE FIX: Process any orphan headers waiting for this parent
+    // Now that we've accepted this header, check if any orphans were waiting for it
+    auto orphan_it = orphan_headers_by_parent_.find(key);
+    if (orphan_it != orphan_headers_by_parent_.end()) {
+        // Move orphans out before processing (avoid iterator invalidation)
+        std::vector<BlockHeader> orphans_to_process = std::move(orphan_it->second);
+        orphan_headers_by_parent_.erase(orphan_it);
+
+        // Process each orphan recursively
+        for (const auto& orphan : orphans_to_process) {
+            std::string orphan_err;
+            accept_header(orphan, orphan_err);  // Recursive call - will process its children too
+        }
+    }
 
     if (best_header_key_.empty()) {
         best_header_key_ = key;
