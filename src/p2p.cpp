@@ -5638,8 +5638,12 @@ void P2P::loop(){
                   chain_height < target_height &&
                   (tnow - g_last_progress_ms) > STALL_RECOVERY_MS) {
 
-                  log_warn("P2P: Sync stalled for 2s at height " + std::to_string(chain_height) +
-                           "/" + std::to_string(target_height) + " - forcing INSTANT recovery");
+                  // DIAGNOSTIC: Show where target comes from (headers vs peer announcement)
+                  std::string target_source = (header_height >= max_peer) ? "headers" : "peer_announcement";
+                  log_warn("P2P: Sync stalled at height " + std::to_string(chain_height) +
+                           "/" + std::to_string(target_height) + " [" + target_source +
+                           ": hdr=" + std::to_string(header_height) +
+                           " peer=" + std::to_string(max_peer) + "] - recovering");
 
                   // CRITICAL FIX: Clear ALL global requested indices above current height
                   // This handles orphaned indices that got stuck without per-peer tracking
