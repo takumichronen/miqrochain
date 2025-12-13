@@ -23,6 +23,7 @@ namespace p2p_stats {
 #include "mempool.h"        // For compact block reconstruction
 #include "assume_valid.h"   // Checkpoint verification for fork detection
 #include "ibd_state.h"      // Bitcoin Core-aligned IBD state machine
+#include "block_download.h" // Bitcoin Core-aligned block download manager
 
 #include <chrono>
 #include <deque>
@@ -3945,34 +3946,23 @@ bool P2P::request_block_index(PeerState& ps, uint64_t index){
         }
     }
 
-    // FALLBACK: No header available - use getbi (index-based)
-    // This should be rare after headers are synced
-    uint8_t p[8];
-    for (int i = 0; i < 8; i++) {
-        p[i] = (uint8_t)((index >> (8 * i)) & 0xFF);
-    }
-    auto msg = encode_msg("getbi", std::vector<uint8_t>(p, p + 8));
-    if (send_or_close(ps.sock, msg)) {
-        // Track inflight timestamp and ordering per-peer for oldest-first retries
-        g_inflight_index_ts[(Sock)ps.sock][index] = now_ms();
-        g_inflight_index_order[(Sock)ps.sock].push_back(index);
-
-        // TIMING: Record first block request after force_mode
-        #if MIQ_TIMING_INSTRUMENTATION
-        if (g_force_completion_mode.load(std::memory_order_relaxed)) {
-            int64_t first_req = g_timing_first_block_req_ms.load(std::memory_order_relaxed);
-            if (first_req == 0) {
-                g_timing_first_block_req_ms.store(now_ms(), std::memory_order_relaxed);
-            }
-        }
-        #endif
-
-        // BULLETPROOF SYNC: Mark this index as globally requested
-        {
-            InflightLock lk(g_inflight_lock);
-            g_global_requested_indices.insert(index);
-        }
-        return true;
+    // ================================================================
+    // BITCOIN CORE ALIGNMENT: NO getbi FALLBACK
+    // ================================================================
+    // We NEVER request blocks by index. If we don't have the header,
+    // we wait for the headers phase to complete. This ensures:
+    // 1. All block requests are hash-based (deterministic)
+    // 2. We can verify received blocks match expected hash
+    // 3. Fork detection works correctly
+    // 4. Sync behavior is identical across runs
+    // ================================================================
+    static int64_t last_header_wait_log_ms = 0;
+    int64_t now = now_ms();
+    if (now - last_header_wait_log_ms > 5000) {
+        last_header_wait_log_ms = now;
+        log_info("[SYNC] Waiting for headers at height " + std::to_string(index) +
+                 " (current header_height=" + std::to_string(hdr_height) +
+                 ") - hash-based requests only");
     }
     return false;
 }
@@ -6288,8 +6278,9 @@ void P2P::loop(){
               static int gap_request_count = 0;
               const int64_t tnow = now_ms();
 
-              // PATIENT: Check every 2s during IBD, every 500ms near-tip
-              const int64_t gap_check_interval = miq::is_ibd_mode() ? 2000 : 500;
+              // AGGRESSIVE: Check every 100ms to detect gaps immediately
+              // Bitcoin Core-aligned: missing blocks must be detected within bounded time
+              const int64_t gap_check_interval = 100;
 
               if (tnow - last_gap_check_ms > gap_check_interval) {
                   last_gap_check_ms = tnow;
@@ -6369,20 +6360,14 @@ void P2P::loop(){
                                           }
                                       }
 
-                                      // Fallback to index-based if hash not available or send failed
-                                      if (!sent) {
-                                          uint8_t p8[8];
-                                          for (int i = 0; i < 8; i++) p8[i] = (uint8_t)((next_needed >> (8 * i)) & 0xFF);
-                                          auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
-                                          if (send_or_close(target, msg)) {
-                                              g_inflight_index_ts[target][next_needed] = tnow;
-                                              g_inflight_index_order[target].push_back(next_needed);
-                                              {
-                                                  InflightLock lk(g_inflight_lock);
-                                                  g_global_requested_indices.insert(next_needed);
-                                              }
-                                              itT->second.inflight_index++;
-                                              sent = true;
+                                      // NO getbi fallback - wait for headers
+                                      // If we don't have the hash, log and continue
+                                      if (!sent && !have_hash) {
+                                          static int64_t last_no_hash_log = 0;
+                                          if (tnow - last_no_hash_log > 5000) {
+                                              last_no_hash_log = tnow;
+                                              log_info("[SYNC] Gap at " + std::to_string(next_needed) +
+                                                      " - waiting for header (no getbi)");
                                           }
                                       }
                                   }
@@ -6395,47 +6380,34 @@ void P2P::loop(){
                                   if (!kvp.second.verack_ok) continue;
                                   peers_to_try.push_back(kvp.first);
                               }
-                              if (!peers_to_try.empty()) {
+                              if (!peers_to_try.empty() && have_hash) {
+                                  // HASH-BASED ONLY: Skip if we don't have header
                                   peer_round_robin = (peer_round_robin + 1) % peers_to_try.size();
                                   Sock try_peer = peers_to_try[peer_round_robin];
                                   auto itT = peers_.find(try_peer);
                                   if (itT != peers_.end()) {
-                                      if (have_hash) {
-                                          auto msg = encode_msg("getb", block_hash);
-                                          send_or_close(try_peer, msg);
-                                      } else {
-                                          uint8_t p8[8];
-                                          for (int i = 0; i < 8; i++) p8[i] = (uint8_t)((next_needed >> (8 * i)) & 0xFF);
-                                          auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
-                                          send_or_close(try_peer, msg);
-                                      }
+                                      auto msg = encode_msg("getb", block_hash);
+                                      send_or_close(try_peer, msg);
                                       log_info("P2P: Gap retry " + std::to_string(next_needed) +
-                                               " from peer " + itT->second.ip);
+                                               " from peer " + itT->second.ip + " [hash-based]");
                                   }
                               }
                           } else {
                               // After 15 attempts (30s): Broadcast to ALL peers
                               // But only do this ONCE per gap, then give up and wait
-                              if (gap_request_count == 16) {
+                              if (gap_request_count == 16 && have_hash) {
+                                  // HASH-BASED BROADCAST: Only if we have the header
                                   log_warn("P2P: Gap at index " + std::to_string(next_needed) +
-                                           " - broadcasting to ALL peers (final attempt)");
+                                           " - broadcasting to ALL peers (final attempt) [hash-based]");
 
                                   int sent_count = 0;
                                   for (auto& kvp : peers_) {
                                       if (!kvp.second.verack_ok) continue;
-
-                                      if (have_hash) {
-                                          auto msg = encode_msg("getb", block_hash);
-                                          if (send_or_close(kvp.first, msg)) sent_count++;
-                                      } else {
-                                          uint8_t p8[8];
-                                          for (int i = 0; i < 8; i++) p8[i] = (uint8_t)((next_needed >> (8 * i)) & 0xFF);
-                                          auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
-                                          if (send_or_close(kvp.first, msg)) sent_count++;
-                                      }
+                                      auto msg = encode_msg("getb", block_hash);
+                                      if (send_or_close(kvp.first, msg)) sent_count++;
                                   }
                                   log_info("P2P: Broadcast gap " + std::to_string(next_needed) +
-                                           " to " + std::to_string(sent_count) + " peers");
+                                           " to " + std::to_string(sent_count) + " peers [hash-based]");
                               }
                               // After broadcast, wait 30 more seconds before trying again
                               // gap_request_count will keep incrementing but we won't spam
