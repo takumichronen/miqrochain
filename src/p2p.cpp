@@ -3262,13 +3262,16 @@ void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
     //   - All sends happen in parallel outside locks
 
     // TIMING: Record relay time and log latency from block receive
+    // PERF FIX: Only log timing when near-tip, not during IBD bulk download
     #if MIQ_TIMING_INSTRUMENTATION
-    g_timing_last_relay_ms.store(now_ms(), std::memory_order_relaxed);
-    int64_t recv_time = g_timing_last_block_recv_ms.load(std::memory_order_relaxed);
-    if (recv_time > 0) {
-        int64_t relay_latency = now_ms() - recv_time;
-        if (relay_latency < 5000) {  // Only log reasonable latencies
-            log_info("[TIMING] Block recv→relay latency: " + std::to_string(relay_latency) + "ms");
+    if (!miq::is_ibd_mode()) {
+        g_timing_last_relay_ms.store(now_ms(), std::memory_order_relaxed);
+        int64_t recv_time = g_timing_last_block_recv_ms.load(std::memory_order_relaxed);
+        if (recv_time > 0) {
+            int64_t relay_latency = now_ms() - recv_time;
+            if (relay_latency < 5000) {  // Only log reasonable latencies
+                log_info("[TIMING] Block recv→relay latency: " + std::to_string(relay_latency) + "ms");
+            }
         }
     }
     #endif
@@ -3373,9 +3376,12 @@ void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
         legacy_sent = parallel_send_to_peers(legacy_sockets, invb_msg);
     }
 
-    MIQ_LOG_INFO(miq::LogCategory::NET, "ULTRA-FAST broadcast: headers=" +
-        std::to_string(headers_sent) + " compact=" + std::to_string(compact_sent) +
-        " legacy=" + std::to_string(legacy_sent) + " peers");
+    // PERF FIX: Only log relay stats when near-tip and we actually relayed to someone
+    if (!miq::is_ibd_mode() && (headers_sent + compact_sent + legacy_sent) > 0) {
+        MIQ_LOG_INFO(miq::LogCategory::NET, "ULTRA-FAST broadcast: headers=" +
+            std::to_string(headers_sent) + " compact=" + std::to_string(compact_sent) +
+            " legacy=" + std::to_string(legacy_sent) + " peers");
+    }
 
     // Also queue for async processing (handles late-connecting peers)
     announce_block_async(h);
@@ -6057,26 +6063,47 @@ void P2P::loop(){
                       global_inflight = g_global_requested_indices.size();
                   }
 
-                  // AGGRESSIVE RECOVERY: If we're behind and nothing is in flight,
-                  // OR if we have stale global indices (peers disconnected mid-sync),
-                  // force restart ALL peers
-                  bool needs_recovery = (!any_active && total_inflight == 0 && global_inflight == 0);
+                  // NUCLEAR RECOVERY: Only trigger if we've made ZERO progress for extended period
+                  // AND we have peers that should be sending us blocks
+                  // COOLDOWN FIX: Track last trigger time and last height to prevent thrashing
+                  static int64_t last_nuclear_trigger_ms = 0;
+                  static uint64_t last_nuclear_height = 0;
+                  const int64_t nuclear_cooldown_ms = 30000;  // 30 second cooldown between nuclear events
+
+                  bool needs_recovery = false;
+                  if (!any_active && total_inflight == 0 && global_inflight == 0) {
+                      // Additional checks: Only fire if we haven't made progress AND haven't fired recently
+                      bool cooldown_passed = (tnow - last_nuclear_trigger_ms > nuclear_cooldown_ms);
+                      bool no_progress = (chain_height == last_nuclear_height || last_nuclear_height == 0);
+
+                      if (cooldown_passed && no_progress) {
+                          needs_recovery = true;
+                      }
+                  }
 
                   // Also recover if we have global indices but no peer tracking them
                   // (indicates stale state from disconnected peers)
+                  // Apply same cooldown to stale indices recovery
                   if (!needs_recovery && global_inflight > 0) {
-                      size_t tracked_by_peers = 0;
-                      for (const auto& kv : g_inflight_index_ts) {
-                          tracked_by_peers += kv.second.size();
-                      }
-                      if (tracked_by_peers == 0) {
-                          needs_recovery = true;
-                          log_warn("P2P: Stale global indices detected (" +
-                                   std::to_string(global_inflight) + " global, 0 tracked)");
+                      bool cooldown_passed = (tnow - last_nuclear_trigger_ms > nuclear_cooldown_ms);
+                      if (cooldown_passed) {
+                          size_t tracked_by_peers = 0;
+                          for (const auto& kv : g_inflight_index_ts) {
+                              tracked_by_peers += kv.second.size();
+                          }
+                          if (tracked_by_peers == 0) {
+                              needs_recovery = true;
+                              log_warn("P2P: Stale global indices detected (" +
+                                       std::to_string(global_inflight) + " global, 0 tracked)");
+                          }
                       }
                   }
 
                   if (needs_recovery) {
+                      // Update cooldown tracking
+                      last_nuclear_trigger_ms = tnow;
+                      last_nuclear_height = chain_height;
+
                       log_warn("P2P: NUCLEAR RECOVERY - no active sync, forcing all peers to restart");
 
                       // Clear stale global state first
@@ -8756,6 +8783,14 @@ void P2P::loop(){
                             ps.total_blocks_received++;
                             ps.total_block_bytes_received += m.payload.size();
 
+                            // INFLIGHT FIX: Peer delivered a block, ALWAYS decrement their inflight counter
+                            // This is simpler and more reliable than trying to match specific indices
+                            // The complex matching logic below can clean up tracking maps, but the counter
+                            // must be decremented to allow fill_index_pipeline to request more blocks
+                            if (ps.syncing && ps.inflight_index > 0) {
+                                ps.inflight_index--;
+                            }
+
                             // BULLETPROOF SYNC FIX: When chain grows, ALWAYS clear those indices from global tracking
                             // This is the most reliable way to keep sync moving - if chain accepted blocks,
                             // those indices are done and should be cleared regardless of identification.
@@ -8766,7 +8801,8 @@ void P2P::loop(){
                                 }
                             }
 
-                            if (ps.inflight_index > 0) {
+                            // Additional cleanup: Try to identify and clear the specific index from per-peer tracking
+                            if (!g_inflight_index_ts[(Sock)s].empty()) {
                                 // Try to identify which specific index this peer delivered
                                 // so we can update per-peer tracking accurately
                                 uint64_t delivered_idx = 0;
@@ -8824,13 +8860,8 @@ void P2P::loop(){
                                     }
                                 }
 
-                                // CRITICAL: Decrement inflight_index when we receive a block.
-                                // The peer sent us data, so they fulfilled ONE request.
-                                // CRITICAL FIX: Must check > 0 to avoid uint32_t underflow!
-                                // If inflight_index wraps to 4 billion, fill_index_pipeline never sends requests
-                                if (ps.inflight_index > 0) {
-                                    ps.inflight_index--;
-                                }
+                                // NOTE: inflight_index decrement happens earlier (line ~8790) unconditionally
+                                // when ps.syncing is true. No need to decrement again here.
 
                                 // CRITICAL FIX: Reset timeout counter AND re-enable the peer!
                                 // The peer just successfully delivered a block, proving it works.
