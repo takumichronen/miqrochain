@@ -92,7 +92,6 @@ namespace p2p_stats {
 
 #if MIQ_TIMING_INSTRUMENTATION
 static std::atomic<int64_t> g_timing_force_mode_enabled_ms{0};
-static std::atomic<int64_t> g_timing_first_block_req_ms{0};
 static std::atomic<int64_t> g_timing_last_block_recv_ms{0};
 static std::atomic<int64_t> g_timing_last_relay_ms{0};
 static std::atomic<int64_t> g_timing_peers_triggered_count{0};
