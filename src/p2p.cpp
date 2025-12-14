@@ -3805,11 +3805,31 @@ void P2P::fill_index_pipeline(PeerState& ps){
         {
             InflightLock lk(g_inflight_lock);
             const bool force_mode = g_force_completion_mode.load(std::memory_order_relaxed);
+
+            // DIAG: Track consecutive skips to detect stuck indices
+            static uint64_t consecutive_skips = 0;
+            static int64_t last_skip_log_ms = 0;
+
             if (!force_mode && g_global_requested_indices.count(idx)) {
+                consecutive_skips++;
+
+                // Log if we're skipping many consecutive indices
+                int64_t now_skip = now_ms();
+                if (consecutive_skips >= 50 && (now_skip - last_skip_log_ms > 5000)) {
+                    last_skip_log_ms = now_skip;
+                    log_warn("[SYNC-DIAG] Skipped " + std::to_string(consecutive_skips) +
+                            " consecutive indices in global_requested! idx=" + std::to_string(idx) +
+                            " global_size=" + std::to_string(g_global_requested_indices.size()) +
+                            " chain=" + std::to_string(chain_.height()));
+                    consecutive_skips = 0;
+                }
+
                 // Another peer is already fetching this index, skip to next
                 ps.next_index++;
                 continue;
             }
+            // Reset when we actually make a request
+            consecutive_skips = 0;
         }
 
         // Check if we should skip this index (already have it or exceeds limits)
