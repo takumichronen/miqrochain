@@ -855,16 +855,71 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
 
     // BITCOIN CORE FIX: Process any orphan headers waiting for this parent
     // Now that we've accepted this header, check if any orphans were waiting for it
-    auto orphan_it = orphan_headers_by_parent_.find(key);
-    if (orphan_it != orphan_headers_by_parent_.end()) {
-        // Move orphans out before processing (avoid iterator invalidation)
-        std::vector<BlockHeader> orphans_to_process = std::move(orphan_it->second);
-        orphan_headers_by_parent_.erase(orphan_it);
+    // Use ITERATIVE approach (not recursive) to prevent stack overflow on long chains
+    std::vector<std::string> keys_to_check;
+    keys_to_check.push_back(key);
 
-        // Process each orphan recursively
-        for (const auto& orphan : orphans_to_process) {
-            std::string orphan_err;
-            accept_header(orphan, orphan_err);  // Recursive call - will process its children too
+    while (!keys_to_check.empty()) {
+        std::string current_key = std::move(keys_to_check.back());
+        keys_to_check.pop_back();
+
+        auto orphan_it = orphan_headers_by_parent_.find(current_key);
+        if (orphan_it != orphan_headers_by_parent_.end()) {
+            // Move orphans out before processing (avoid iterator invalidation)
+            std::vector<BlockHeader> orphans_to_process = std::move(orphan_it->second);
+            orphan_headers_by_parent_.erase(orphan_it);
+
+            // Process each orphan - add its key to check for its children
+            for (const auto& orphan : orphans_to_process) {
+                const auto orphan_hash = header_hash_of(orphan);
+                const auto orphan_key = hk(orphan_hash);
+
+                // Try to accept this orphan now that its parent exists
+                // We need to re-run the full acceptance logic
+                HeaderMeta om;
+                om.hash = orphan_hash;
+                om.prev = orphan.prev_hash;
+                om.bits = orphan.bits;
+                om.time = orphan.time;
+                om.have_block = have_block(om.hash);
+
+                // Find parent (should exist now)
+                auto parent_it = header_index_.find(current_key);
+                if (parent_it != header_index_.end()) {
+                    om.height = parent_it->second.height + 1;
+                    om.work_sum = parent_it->second.work_sum + work_from_bits(orphan.bits);
+
+                    // Checkpoint validation
+                    if (!miq::check_checkpoint(om.height, orphan_hash)) {
+                        continue;  // Skip invalid orphan
+                    }
+
+                    // Add to index
+                    header_index_.emplace(orphan_key, std::move(om));
+                    set_header_full(orphan_key, orphan);
+
+                    // Update best header if needed
+                    auto cur_it = header_index_.find(best_header_key_);
+                    auto neu_it = header_index_.find(orphan_key);
+                    if (cur_it != header_index_.end() && neu_it != header_index_.end()) {
+                        const auto& cur = cur_it->second;
+                        const auto& neu = neu_it->second;
+                        auto eps = [](long double a, long double b){
+                            long double scale = std::max<long double>(1.0L, std::max(std::fabs(a), std::fabs(b)));
+                            return 1e-12L * scale;
+                        };
+                        long double e = eps(neu.work_sum, cur.work_sum);
+                        bool greater = (neu.work_sum - cur.work_sum) > e;
+                        bool equalish = std::fabs(neu.work_sum - cur.work_sum) <= e;
+                        if (greater || (equalish && neu.height > cur.height)) {
+                            best_header_key_ = orphan_key;
+                        }
+                    }
+
+                    // Check if this orphan has its own orphan children
+                    keys_to_check.push_back(orphan_key);
+                }
+            }
         }
     }
 
