@@ -23,6 +23,7 @@ namespace p2p_stats {
 #include "mempool.h"        // For compact block reconstruction
 #include "assume_valid.h"   // Checkpoint verification for fork detection
 #include "ibd_state.h"      // Bitcoin Core-aligned IBD state machine
+#include "block_download.h" // Bitcoin Core-aligned block download manager
 
 #include <chrono>
 #include <deque>
@@ -91,7 +92,6 @@ namespace p2p_stats {
 
 #if MIQ_TIMING_INSTRUMENTATION
 static std::atomic<int64_t> g_timing_force_mode_enabled_ms{0};
-static std::atomic<int64_t> g_timing_first_block_req_ms{0};
 static std::atomic<int64_t> g_timing_last_block_recv_ms{0};
 static std::atomic<int64_t> g_timing_last_relay_ms{0};
 static std::atomic<int64_t> g_timing_peers_triggered_count{0};
@@ -1683,47 +1683,62 @@ static inline void clear_fulfilled_indices_up_to_height(size_t new_h, uint64_t h
     // This ensures indices below the current chain height are removed,
     // allowing the sync to progress without getting stuck on old indices.
     // Also clear any corrupted indices beyond header height.
+
+    // PERFORMANCE FIX: Throttle cleanup to reduce lock contention
+    // With many connections, this function was being called 50+ times/sec
+    // Each call iterated the entire global_requested_indices set while holding lock
+    // This caused severe lock contention and slowdowns
+    static int64_t last_cleanup_ms = 0;
+    static size_t last_cleanup_height = 0;
+    int64_t now = now_ms();
+
+    // Only run full cleanup every 100ms OR if height advanced significantly
+    bool should_run = (now - last_cleanup_ms > 100) ||
+                      (new_h > last_cleanup_height + 10);
+    if (!should_run) {
+        return;
+    }
+    last_cleanup_ms = now;
+    last_cleanup_height = new_h;
+
     {
         InflightLock lk(g_inflight_lock);
-        std::vector<uint64_t> to_remove;
-        for (uint64_t idx : g_global_requested_indices) {
-            // Clear fulfilled indices
-            if (idx <= (uint64_t)new_h) {
-                to_remove.push_back(idx);
-            }
-            // CRITICAL: Also clear corrupted indices beyond header height
-            else if (header_height > 0 && idx > header_height) {
-                to_remove.push_back(idx);
-            }
-        }
-        for (uint64_t idx : to_remove) {
-            g_global_requested_indices.erase(idx);
-        }
-    }
-
-    for (auto &kv : g_inflight_index_ts){
-        Sock s = kv.first;
-        auto &byidx = kv.second;
-        auto &dq = g_inflight_index_order[s];
-
-        // Remove from timestamp map any indices we must already have received
-        // OR any corrupted indices beyond header height
-        for (auto it = byidx.begin(); it != byidx.end(); ){
-            if (it->first <= (uint64_t)new_h) {
-                it = byidx.erase(it);
-            } else if (header_height > 0 && it->first > header_height) {
-                // CRITICAL: Clear corrupted indices beyond header height
-                it = byidx.erase(it);
+        // Use erase_if pattern with iterator for efficiency
+        for (auto it = g_global_requested_indices.begin(); it != g_global_requested_indices.end(); ) {
+            uint64_t idx = *it;
+            if (idx <= (uint64_t)new_h || (header_height > 0 && idx > header_height)) {
+                it = g_global_requested_indices.erase(it);
             } else {
                 ++it;
             }
         }
+    }
 
-        // Trim the front of the oldest-first deque
-        // Also remove any corrupted indices beyond header height
-        while (!dq.empty() && (dq.front() <= (uint64_t)new_h ||
-               (header_height > 0 && dq.front() > header_height))) {
-            dq.pop_front();
+    // Per-peer cleanup - also needs lock protection
+    {
+        InflightLock lk(g_inflight_lock);
+        for (auto &kv : g_inflight_index_ts){
+            Sock s = kv.first;
+            auto &byidx = kv.second;
+            auto &dq = g_inflight_index_order[s];
+
+            // Remove from timestamp map any indices we must already have received
+            // OR any corrupted indices beyond header height
+            for (auto it = byidx.begin(); it != byidx.end(); ){
+                if (it->first <= (uint64_t)new_h) {
+                    it = byidx.erase(it);
+                } else if (header_height > 0 && it->first > header_height) {
+                    it = byidx.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
+            // Trim the front of the oldest-first deque
+            while (!dq.empty() && (dq.front() <= (uint64_t)new_h ||
+                   (header_height > 0 && dq.front() > header_height))) {
+                dq.pop_front();
+            }
         }
     }
 }
@@ -3262,13 +3277,16 @@ void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
     //   - All sends happen in parallel outside locks
 
     // TIMING: Record relay time and log latency from block receive
+    // PERF FIX: Only log timing when near-tip, not during IBD bulk download
     #if MIQ_TIMING_INSTRUMENTATION
-    g_timing_last_relay_ms.store(now_ms(), std::memory_order_relaxed);
-    int64_t recv_time = g_timing_last_block_recv_ms.load(std::memory_order_relaxed);
-    if (recv_time > 0) {
-        int64_t relay_latency = now_ms() - recv_time;
-        if (relay_latency < 5000) {  // Only log reasonable latencies
-            log_info("[TIMING] Block recv→relay latency: " + std::to_string(relay_latency) + "ms");
+    if (!miq::is_ibd_mode()) {
+        g_timing_last_relay_ms.store(now_ms(), std::memory_order_relaxed);
+        int64_t recv_time = g_timing_last_block_recv_ms.load(std::memory_order_relaxed);
+        if (recv_time > 0) {
+            int64_t relay_latency = now_ms() - recv_time;
+            if (relay_latency < 5000) {  // Only log reasonable latencies
+                log_info("[TIMING] Block recv→relay latency: " + std::to_string(relay_latency) + "ms");
+            }
         }
     }
     #endif
@@ -3373,9 +3391,12 @@ void P2P::broadcast_inv_block(const std::vector<uint8_t>& h){
         legacy_sent = parallel_send_to_peers(legacy_sockets, invb_msg);
     }
 
-    MIQ_LOG_INFO(miq::LogCategory::NET, "ULTRA-FAST broadcast: headers=" +
-        std::to_string(headers_sent) + " compact=" + std::to_string(compact_sent) +
-        " legacy=" + std::to_string(legacy_sent) + " peers");
+    // PERF FIX: Only log relay stats when near-tip and we actually relayed to someone
+    if (!miq::is_ibd_mode() && (headers_sent + compact_sent + legacy_sent) > 0) {
+        MIQ_LOG_INFO(miq::LogCategory::NET, "ULTRA-FAST broadcast: headers=" +
+            std::to_string(headers_sent) + " compact=" + std::to_string(compact_sent) +
+            " legacy=" + std::to_string(legacy_sent) + " peers");
+    }
 
     // Also queue for async processing (handles late-connecting peers)
     announce_block_async(h);
@@ -3799,11 +3820,31 @@ void P2P::fill_index_pipeline(PeerState& ps){
         {
             InflightLock lk(g_inflight_lock);
             const bool force_mode = g_force_completion_mode.load(std::memory_order_relaxed);
+
+            // DIAG: Track consecutive skips to detect stuck indices
+            static uint64_t consecutive_skips = 0;
+            static int64_t last_skip_log_ms = 0;
+
             if (!force_mode && g_global_requested_indices.count(idx)) {
+                consecutive_skips++;
+
+                // Log if we're skipping many consecutive indices
+                int64_t now_skip = now_ms();
+                if (consecutive_skips >= 50 && (now_skip - last_skip_log_ms > 5000)) {
+                    last_skip_log_ms = now_skip;
+                    log_warn("[SYNC-DIAG] Skipped " + std::to_string(consecutive_skips) +
+                            " consecutive indices in global_requested! idx=" + std::to_string(idx) +
+                            " global_size=" + std::to_string(g_global_requested_indices.size()) +
+                            " chain=" + std::to_string(chain_.height()));
+                    consecutive_skips = 0;
+                }
+
                 // Another peer is already fetching this index, skip to next
                 ps.next_index++;
                 continue;
             }
+            // Reset when we actually make a request
+            consecutive_skips = 0;
         }
 
         // Check if we should skip this index (already have it or exceeds limits)
@@ -3939,34 +3980,23 @@ bool P2P::request_block_index(PeerState& ps, uint64_t index){
         }
     }
 
-    // FALLBACK: No header available - use getbi (index-based)
-    // This should be rare after headers are synced
-    uint8_t p[8];
-    for (int i = 0; i < 8; i++) {
-        p[i] = (uint8_t)((index >> (8 * i)) & 0xFF);
-    }
-    auto msg = encode_msg("getbi", std::vector<uint8_t>(p, p + 8));
-    if (send_or_close(ps.sock, msg)) {
-        // Track inflight timestamp and ordering per-peer for oldest-first retries
-        g_inflight_index_ts[(Sock)ps.sock][index] = now_ms();
-        g_inflight_index_order[(Sock)ps.sock].push_back(index);
-
-        // TIMING: Record first block request after force_mode
-        #if MIQ_TIMING_INSTRUMENTATION
-        if (g_force_completion_mode.load(std::memory_order_relaxed)) {
-            int64_t first_req = g_timing_first_block_req_ms.load(std::memory_order_relaxed);
-            if (first_req == 0) {
-                g_timing_first_block_req_ms.store(now_ms(), std::memory_order_relaxed);
-            }
-        }
-        #endif
-
-        // BULLETPROOF SYNC: Mark this index as globally requested
-        {
-            InflightLock lk(g_inflight_lock);
-            g_global_requested_indices.insert(index);
-        }
-        return true;
+    // ================================================================
+    // BITCOIN CORE ALIGNMENT: NO getbi FALLBACK
+    // ================================================================
+    // We NEVER request blocks by index. If we don't have the header,
+    // we wait for the headers phase to complete. This ensures:
+    // 1. All block requests are hash-based (deterministic)
+    // 2. We can verify received blocks match expected hash
+    // 3. Fork detection works correctly
+    // 4. Sync behavior is identical across runs
+    // ================================================================
+    static int64_t last_header_wait_log_ms = 0;
+    int64_t now = now_ms();
+    if (now - last_header_wait_log_ms > 5000) {
+        last_header_wait_log_ms = now;
+        log_info("[SYNC] Waiting for headers at height " + std::to_string(index) +
+                 " (current header_height=" + std::to_string(hdr_height) +
+                 ") - hash-based requests only");
     }
     return false;
 }
@@ -4336,13 +4366,38 @@ void P2P::queue_block_by_height(uint64_t height, const std::vector<uint8_t>& has
 void P2P::evict_pending_blocks_if_needed() {
     // Remove blocks that are already in chain or too far behind
     uint64_t current_height = chain_.height();
+    int64_t now = now_ms();
+
+    // CRITICAL FIX: Also remove blocks that have been waiting too long (30 seconds)
+    // If a block has been pending for 30s, its predecessor likely failed to arrive.
+    // Clear it from pending AND global so it can be re-requested.
+    static constexpr int64_t PENDING_BLOCK_TIMEOUT_MS = 30000;
 
     // Remove blocks at or below current height (already processed)
+    // Also remove blocks that have timed out waiting for predecessors
     auto it = pending_blocks_.begin();
     while (it != pending_blocks_.end()) {
+        bool should_remove = false;
+        bool timed_out = false;
+
         if (it->first <= current_height) {
+            should_remove = true;
+        } else if ((now - it->second.received_ms) > PENDING_BLOCK_TIMEOUT_MS) {
+            // Block has been waiting too long - predecessor never arrived
+            should_remove = true;
+            timed_out = true;
+        }
+
+        if (should_remove) {
+            uint64_t removed_height = it->first;
             pending_blocks_bytes_ -= it->second.raw.size();
             it = pending_blocks_.erase(it);
+
+            // If timed out, clear from global tracking so it can be re-requested
+            if (timed_out) {
+                InflightLock lk(g_inflight_lock);
+                g_global_requested_indices.erase(removed_height);
+            }
         } else {
             ++it;
         }
@@ -4420,6 +4475,12 @@ void P2P::process_pending_blocks() {
                     broadcast_inv_block(it->second.hash);
                     g_last_progress_ms = now_ms();
                     g_last_progress_height = chain_.height();
+
+                    // CRITICAL FIX: Clear from global tracking after successful reorg
+                    {
+                        InflightLock lk(g_inflight_lock);
+                        g_global_requested_indices.erase(next_height);
+                    }
 
                     // Update heights for next iteration
                     current_height = chain_.height();
@@ -4519,6 +4580,14 @@ void P2P::process_pending_blocks() {
 
             // Also try to connect any orphans that were waiting for this block
             try_connect_orphans(hexkey(it->second.hash));
+
+            // CRITICAL FIX: Clear from global tracking after successful processing!
+            // Without this, the index stays in g_global_requested_indices forever,
+            // causing fill_index_pipeline to skip it and stall sync.
+            {
+                InflightLock lk(g_inflight_lock);
+                g_global_requested_indices.erase(next_height);
+            }
 
             // Remove from pending queue
             pending_blocks_bytes_ -= it->second.raw.size();
@@ -5233,7 +5302,7 @@ void P2P::loop(){
                         if (!pps.verack_ok) continue;
                         if (!peer_is_index_capable((Sock)pps.sock)) continue;
                         pps.syncing = true;
-                        pps.inflight_index = 0;
+                        // BITCOIN CORE FIX: Do NOT reset inflight_index - may have outstanding requests
                         pps.next_index = chain_.height() + 1;
                         fill_index_pipeline(pps);
                     }
@@ -5657,7 +5726,6 @@ void P2P::loop(){
               g_peer_index_capable[s] = false;
               auto &ps = kvp.second;
               ps.syncing = false;
-              ps.inflight_index = 0;
 
               // BULLETPROOF SYNC: Clear global index tracking when peer is demoted
               // This prevents indices from getting stuck in the global set
@@ -5672,6 +5740,8 @@ void P2P::loop(){
               }
               g_inflight_index_ts.erase(s);
               g_inflight_index_order.erase(s);
+              // BITCOIN CORE FIX: Reset inflight_index AFTER clearing tracking
+              ps.inflight_index = 0;
 
               // CRITICAL FIX: Reset peer_tip_height when peer is demoted due to timeouts
               // This prevents peer_tip_height from being stuck at incorrect values
@@ -5721,7 +5791,7 @@ void P2P::loop(){
                           g_peer_index_capable[s] = true;
                           g_index_timeouts[s] = 0;  // Reset timeout counter
                           kvp.second.syncing = true;
-                          kvp.second.inflight_index = 0;
+                          // BITCOIN CORE FIX: Do NOT reset inflight_index - may have outstanding requests
                           kvp.second.next_index = chain_.height() + 1;
                           // CRITICAL FIX: Actually start requesting blocks after re-enabling
                           // Without this, the peer is marked as syncing but no requests are made
@@ -5780,7 +5850,7 @@ void P2P::loop(){
                           // Ensure peer is syncing
                           if (!kvp.second.syncing) {
                               kvp.second.syncing = true;
-                              kvp.second.inflight_index = 0;
+                              // BITCOIN CORE FIX: Do NOT reset inflight_index
                               kvp.second.next_index = chain_height + 1;
                           }
 
@@ -5808,7 +5878,7 @@ void P2P::loop(){
                   // Force activate and refill for all capable peers
                   if (!kvp.second.syncing) {
                       kvp.second.syncing = true;
-                      kvp.second.inflight_index = 0;
+                      // BITCOIN CORE FIX: Do NOT reset inflight_index
                       kvp.second.next_index = chain_.height() + 1;
                   }
                   fill_index_pipeline(kvp.second);
@@ -5881,7 +5951,7 @@ void P2P::loop(){
 
                       // Reset sync state
                       kvp.second.syncing = true;
-                      kvp.second.inflight_index = 0;
+                      // BITCOIN CORE FIX: Do NOT reset inflight_index
                       kvp.second.next_index = chain_height + 1;
 
                       // Clear per-peer inflight tracking
@@ -6057,26 +6127,47 @@ void P2P::loop(){
                       global_inflight = g_global_requested_indices.size();
                   }
 
-                  // AGGRESSIVE RECOVERY: If we're behind and nothing is in flight,
-                  // OR if we have stale global indices (peers disconnected mid-sync),
-                  // force restart ALL peers
-                  bool needs_recovery = (!any_active && total_inflight == 0 && global_inflight == 0);
+                  // NUCLEAR RECOVERY: Only trigger if we've made ZERO progress for extended period
+                  // AND we have peers that should be sending us blocks
+                  // COOLDOWN FIX: Track last trigger time and last height to prevent thrashing
+                  static int64_t last_nuclear_trigger_ms = 0;
+                  static uint64_t last_nuclear_height = 0;
+                  const int64_t nuclear_cooldown_ms = 30000;  // 30 second cooldown between nuclear events
+
+                  bool needs_recovery = false;
+                  if (!any_active && total_inflight == 0 && global_inflight == 0) {
+                      // Additional checks: Only fire if we haven't made progress AND haven't fired recently
+                      bool cooldown_passed = (tnow - last_nuclear_trigger_ms > nuclear_cooldown_ms);
+                      bool no_progress = (chain_height == last_nuclear_height || last_nuclear_height == 0);
+
+                      if (cooldown_passed && no_progress) {
+                          needs_recovery = true;
+                      }
+                  }
 
                   // Also recover if we have global indices but no peer tracking them
                   // (indicates stale state from disconnected peers)
+                  // Apply same cooldown to stale indices recovery
                   if (!needs_recovery && global_inflight > 0) {
-                      size_t tracked_by_peers = 0;
-                      for (const auto& kv : g_inflight_index_ts) {
-                          tracked_by_peers += kv.second.size();
-                      }
-                      if (tracked_by_peers == 0) {
-                          needs_recovery = true;
-                          log_warn("P2P: Stale global indices detected (" +
-                                   std::to_string(global_inflight) + " global, 0 tracked)");
+                      bool cooldown_passed = (tnow - last_nuclear_trigger_ms > nuclear_cooldown_ms);
+                      if (cooldown_passed) {
+                          size_t tracked_by_peers = 0;
+                          for (const auto& kv : g_inflight_index_ts) {
+                              tracked_by_peers += kv.second.size();
+                          }
+                          if (tracked_by_peers == 0) {
+                              needs_recovery = true;
+                              log_warn("P2P: Stale global indices detected (" +
+                                       std::to_string(global_inflight) + " global, 0 tracked)");
+                          }
                       }
                   }
 
                   if (needs_recovery) {
+                      // Update cooldown tracking
+                      last_nuclear_trigger_ms = tnow;
+                      last_nuclear_height = chain_height;
+
                       log_warn("P2P: NUCLEAR RECOVERY - no active sync, forcing all peers to restart");
 
                       // Clear stale global state first
@@ -6094,7 +6185,7 @@ void P2P::loop(){
                           g_peer_index_capable[s] = true;
                           g_index_timeouts[s] = 0;
                           kvp.second.syncing = true;
-                          kvp.second.inflight_index = 0;
+                          // BITCOIN CORE FIX: Do NOT reset inflight_index
                           kvp.second.next_index = chain_height + 1;
                           // Fill pipeline
                           fill_index_pipeline(kvp.second);
@@ -6261,8 +6352,9 @@ void P2P::loop(){
               static int gap_request_count = 0;
               const int64_t tnow = now_ms();
 
-              // PATIENT: Check every 2s during IBD, every 500ms near-tip
-              const int64_t gap_check_interval = miq::is_ibd_mode() ? 2000 : 500;
+              // AGGRESSIVE: Check every 100ms to detect gaps immediately
+              // Bitcoin Core-aligned: missing blocks must be detected within bounded time
+              const int64_t gap_check_interval = 100;
 
               if (tnow - last_gap_check_ms > gap_check_interval) {
                   last_gap_check_ms = tnow;
@@ -6342,20 +6434,14 @@ void P2P::loop(){
                                           }
                                       }
 
-                                      // Fallback to index-based if hash not available or send failed
-                                      if (!sent) {
-                                          uint8_t p8[8];
-                                          for (int i = 0; i < 8; i++) p8[i] = (uint8_t)((next_needed >> (8 * i)) & 0xFF);
-                                          auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
-                                          if (send_or_close(target, msg)) {
-                                              g_inflight_index_ts[target][next_needed] = tnow;
-                                              g_inflight_index_order[target].push_back(next_needed);
-                                              {
-                                                  InflightLock lk(g_inflight_lock);
-                                                  g_global_requested_indices.insert(next_needed);
-                                              }
-                                              itT->second.inflight_index++;
-                                              sent = true;
+                                      // NO getbi fallback - wait for headers
+                                      // If we don't have the hash, log and continue
+                                      if (!sent && !have_hash) {
+                                          static int64_t last_no_hash_log = 0;
+                                          if (tnow - last_no_hash_log > 5000) {
+                                              last_no_hash_log = tnow;
+                                              log_info("[SYNC] Gap at " + std::to_string(next_needed) +
+                                                      " - waiting for header (no getbi)");
                                           }
                                       }
                                   }
@@ -6368,47 +6454,34 @@ void P2P::loop(){
                                   if (!kvp.second.verack_ok) continue;
                                   peers_to_try.push_back(kvp.first);
                               }
-                              if (!peers_to_try.empty()) {
+                              if (!peers_to_try.empty() && have_hash) {
+                                  // HASH-BASED ONLY: Skip if we don't have header
                                   peer_round_robin = (peer_round_robin + 1) % peers_to_try.size();
                                   Sock try_peer = peers_to_try[peer_round_robin];
                                   auto itT = peers_.find(try_peer);
                                   if (itT != peers_.end()) {
-                                      if (have_hash) {
-                                          auto msg = encode_msg("getb", block_hash);
-                                          send_or_close(try_peer, msg);
-                                      } else {
-                                          uint8_t p8[8];
-                                          for (int i = 0; i < 8; i++) p8[i] = (uint8_t)((next_needed >> (8 * i)) & 0xFF);
-                                          auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
-                                          send_or_close(try_peer, msg);
-                                      }
+                                      auto msg = encode_msg("getb", block_hash);
+                                      send_or_close(try_peer, msg);
                                       log_info("P2P: Gap retry " + std::to_string(next_needed) +
-                                               " from peer " + itT->second.ip);
+                                               " from peer " + itT->second.ip + " [hash-based]");
                                   }
                               }
                           } else {
                               // After 15 attempts (30s): Broadcast to ALL peers
                               // But only do this ONCE per gap, then give up and wait
-                              if (gap_request_count == 16) {
+                              if (gap_request_count == 16 && have_hash) {
+                                  // HASH-BASED BROADCAST: Only if we have the header
                                   log_warn("P2P: Gap at index " + std::to_string(next_needed) +
-                                           " - broadcasting to ALL peers (final attempt)");
+                                           " - broadcasting to ALL peers (final attempt) [hash-based]");
 
                                   int sent_count = 0;
                                   for (auto& kvp : peers_) {
                                       if (!kvp.second.verack_ok) continue;
-
-                                      if (have_hash) {
-                                          auto msg = encode_msg("getb", block_hash);
-                                          if (send_or_close(kvp.first, msg)) sent_count++;
-                                      } else {
-                                          uint8_t p8[8];
-                                          for (int i = 0; i < 8; i++) p8[i] = (uint8_t)((next_needed >> (8 * i)) & 0xFF);
-                                          auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
-                                          if (send_or_close(kvp.first, msg)) sent_count++;
-                                      }
+                                      auto msg = encode_msg("getb", block_hash);
+                                      if (send_or_close(kvp.first, msg)) sent_count++;
                                   }
                                   log_info("P2P: Broadcast gap " + std::to_string(next_needed) +
-                                           " to " + std::to_string(sent_count) + " peers");
+                                           " to " + std::to_string(sent_count) + " peers [hash-based]");
                               }
                               // After broadcast, wait 30 more seconds before trying again
                               // gap_request_count will keep incrementing but we won't spam
@@ -6712,7 +6785,7 @@ void P2P::loop(){
 
                             g_peer_index_capable[(Sock)pps.sock] = true;
                             pps.syncing = true;
-                            pps.inflight_index = 0;
+                            // BITCOIN CORE FIX: Do NOT reset inflight_index
                             pps.next_index = chain_.height() + 1;
                             fill_index_pipeline(pps);
                         }
@@ -6794,7 +6867,7 @@ void P2P::loop(){
                     // Mark peer as index-capable and start block sync
                     g_peer_index_capable[(Sock)pps.sock] = true;
                     pps.syncing = true;
-                    pps.inflight_index = 0;
+                    // BITCOIN CORE FIX: Do NOT reset inflight_index
                     pps.next_index = chain_.height() + 1;
                     fill_index_pipeline(pps);
                     log_info("[IBD] Started block sync with " + pps.ip +
@@ -6864,7 +6937,7 @@ void P2P::loop(){
                             // Force activate and refill pipeline
                             if (!pps.syncing) {
                                 pps.syncing = true;
-                                pps.inflight_index = 0;
+                                // BITCOIN CORE FIX: Do NOT reset inflight_index
                                 pps.next_index = current_height + 1;
                             }
                             fill_index_pipeline(pps);
@@ -6993,7 +7066,7 @@ void P2P::loop(){
 
                         if (!pps.syncing) {
                             pps.syncing = true;
-                            pps.inflight_index = 0;
+                            // BITCOIN CORE FIX: Do NOT reset inflight_index
                             pps.next_index = current_height + 1;
                             fill_index_pipeline(pps);
                         }
@@ -7032,7 +7105,7 @@ void P2P::loop(){
                         // causing the stop-start sync pattern
                         if (!pps.syncing) {
                             pps.syncing = true;
-                            pps.inflight_index = 0;
+                            // BITCOIN CORE FIX: Do NOT reset inflight_index
                             pps.next_index = current_height + 1;
                         }
                         fill_index_pipeline(pps);
@@ -7104,7 +7177,7 @@ void P2P::loop(){
 
                         // Always reset and reactivate to ensure fresh sync
                         pps.syncing = true;
-                        pps.inflight_index = 0;
+                        // BITCOIN CORE FIX: Do NOT reset inflight_index
                         pps.next_index = chain_.height() + 1;
                         fill_index_pipeline(pps);
                         activated_peers++;
@@ -7837,8 +7910,8 @@ void P2P::loop(){
 #endif
                         {
                             ps.syncing = true;
-                            ps.inflight_index = 0;
-                            ps.next_index = chain_.height() + 1;  
+                            // BITCOIN CORE FIX: Do NOT reset inflight_index
+                            ps.next_index = chain_.height() + 1;
                             fill_index_pipeline(ps);
                         }
 
@@ -8220,7 +8293,7 @@ void P2P::loop(){
                                     g_index_timeouts[(Sock)s] = 0;  // Reset timeout counter
                                     if (!ps.syncing) {
                                         ps.syncing = true;
-                                        ps.inflight_index = 0;
+                                        // BITCOIN CORE FIX: Do NOT reset inflight_index
                                         ps.next_index = chain_.height() + 1;
                                         log_info("P2P: Re-enabled sync on " + ps.ip + " after receiving extended headers");
                                     }
@@ -8309,7 +8382,7 @@ void P2P::loop(){
                             }
                             if (!ps.syncing) {
                                 ps.syncing = true;
-                                ps.inflight_index = 0;
+                                // BITCOIN CORE FIX: Do NOT reset inflight_index
                                 ps.next_index = chain_.height() + 1;
                             }
                             fill_index_pipeline(ps);
@@ -8756,6 +8829,14 @@ void P2P::loop(){
                             ps.total_blocks_received++;
                             ps.total_block_bytes_received += m.payload.size();
 
+                            // INFLIGHT FIX: Peer delivered a block, ALWAYS decrement their inflight counter
+                            // This is simpler and more reliable than trying to match specific indices
+                            // The complex matching logic below can clean up tracking maps, but the counter
+                            // must be decremented to allow fill_index_pipeline to request more blocks
+                            if (ps.syncing && ps.inflight_index > 0) {
+                                ps.inflight_index--;
+                            }
+
                             // BULLETPROOF SYNC FIX: When chain grows, ALWAYS clear those indices from global tracking
                             // This is the most reliable way to keep sync moving - if chain accepted blocks,
                             // those indices are done and should be cleared regardless of identification.
@@ -8766,7 +8847,8 @@ void P2P::loop(){
                                 }
                             }
 
-                            if (ps.inflight_index > 0) {
+                            // Additional cleanup: Try to identify and clear the specific index from per-peer tracking
+                            if (!g_inflight_index_ts[(Sock)s].empty()) {
                                 // Try to identify which specific index this peer delivered
                                 // so we can update per-peer tracking accurately
                                 uint64_t delivered_idx = 0;
@@ -8824,13 +8906,8 @@ void P2P::loop(){
                                     }
                                 }
 
-                                // CRITICAL: Decrement inflight_index when we receive a block.
-                                // The peer sent us data, so they fulfilled ONE request.
-                                // CRITICAL FIX: Must check > 0 to avoid uint32_t underflow!
-                                // If inflight_index wraps to 4 billion, fill_index_pipeline never sends requests
-                                if (ps.inflight_index > 0) {
-                                    ps.inflight_index--;
-                                }
+                                // NOTE: inflight_index decrement happens earlier (line ~8790) unconditionally
+                                // when ps.syncing is true. No need to decrement again here.
 
                                 // CRITICAL FIX: Reset timeout counter AND re-enable the peer!
                                 // The peer just successfully delivered a block, proving it works.
@@ -9333,7 +9410,7 @@ void P2P::loop(){
                                 // CRITICAL: Mark peer as index-capable and enable fallback
                                 g_peer_index_capable[(Sock)s] = true;
                                 ps.syncing = true;
-                                ps.inflight_index = 0;
+                                // BITCOIN CORE FIX: Do NOT reset inflight_index
                                 ps.next_index = chain_.height() + 1;
                                 fill_index_pipeline(ps);
                                 log_warn("P2P: headers made no progress repeatedly from " + ps.ip +
@@ -9371,7 +9448,7 @@ void P2P::loop(){
                                     // CRITICAL: Mark peer as index-capable for fallback to work
                                     g_peer_index_capable[(Sock)s] = true;
                                     ps.syncing = true;
-                                    ps.inflight_index = 0;
+                                    // BITCOIN CORE FIX: Do NOT reset inflight_index
                                     ps.next_index = chain_.height() + 1;
                                     fill_index_pipeline(ps);
                                     zero_count = 0;
@@ -9402,7 +9479,7 @@ void P2P::loop(){
                                     // Otherwise fill_index_pipeline returns early and fallback doesn't work!
                                     g_peer_index_capable[(Sock)ps.sock] = true;
                                     ps.syncing = true;
-                                    ps.inflight_index = 0;
+                                    // BITCOIN CORE FIX: Do NOT reset inflight_index
                                     ps.next_index = chain_.height() + 1;
                                     fill_index_pipeline(ps);
                                 }
@@ -9616,6 +9693,8 @@ void P2P::loop(){
                         // Clear this peer's inflight tracking and restart
                         g_inflight_index_ts.erase((Sock)s);
                         g_inflight_index_order.erase((Sock)s);
+                        // BITCOIN CORE FIX: Reset inflight_index ONLY when we clear tracking
+                        // This is the one legitimate case - we just cleared all inflight state
                         ps.inflight_index = 0;
                         ps.next_index = chain_.height() + 1;
                         fill_index_pipeline(ps);
@@ -9699,7 +9778,7 @@ void P2P::loop(){
                     // CRITICAL: Mark peer as index-capable for fallback to work
                     g_peer_index_capable[(Sock)s] = true;
                     ps.syncing = true;
-                    ps.inflight_index = 0;
+                    // BITCOIN CORE FIX: Do NOT reset inflight_index
                     ps.next_index = chain_.height() + 1;
                     fill_index_pipeline(ps);
                 }
