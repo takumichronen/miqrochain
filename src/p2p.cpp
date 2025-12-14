@@ -1683,47 +1683,62 @@ static inline void clear_fulfilled_indices_up_to_height(size_t new_h, uint64_t h
     // This ensures indices below the current chain height are removed,
     // allowing the sync to progress without getting stuck on old indices.
     // Also clear any corrupted indices beyond header height.
+
+    // PERFORMANCE FIX: Throttle cleanup to reduce lock contention
+    // With many connections, this function was being called 50+ times/sec
+    // Each call iterated the entire global_requested_indices set while holding lock
+    // This caused severe lock contention and slowdowns
+    static int64_t last_cleanup_ms = 0;
+    static size_t last_cleanup_height = 0;
+    int64_t now = now_ms();
+
+    // Only run full cleanup every 100ms OR if height advanced significantly
+    bool should_run = (now - last_cleanup_ms > 100) ||
+                      (new_h > last_cleanup_height + 10);
+    if (!should_run) {
+        return;
+    }
+    last_cleanup_ms = now;
+    last_cleanup_height = new_h;
+
     {
         InflightLock lk(g_inflight_lock);
-        std::vector<uint64_t> to_remove;
-        for (uint64_t idx : g_global_requested_indices) {
-            // Clear fulfilled indices
-            if (idx <= (uint64_t)new_h) {
-                to_remove.push_back(idx);
-            }
-            // CRITICAL: Also clear corrupted indices beyond header height
-            else if (header_height > 0 && idx > header_height) {
-                to_remove.push_back(idx);
-            }
-        }
-        for (uint64_t idx : to_remove) {
-            g_global_requested_indices.erase(idx);
-        }
-    }
-
-    for (auto &kv : g_inflight_index_ts){
-        Sock s = kv.first;
-        auto &byidx = kv.second;
-        auto &dq = g_inflight_index_order[s];
-
-        // Remove from timestamp map any indices we must already have received
-        // OR any corrupted indices beyond header height
-        for (auto it = byidx.begin(); it != byidx.end(); ){
-            if (it->first <= (uint64_t)new_h) {
-                it = byidx.erase(it);
-            } else if (header_height > 0 && it->first > header_height) {
-                // CRITICAL: Clear corrupted indices beyond header height
-                it = byidx.erase(it);
+        // Use erase_if pattern with iterator for efficiency
+        for (auto it = g_global_requested_indices.begin(); it != g_global_requested_indices.end(); ) {
+            uint64_t idx = *it;
+            if (idx <= (uint64_t)new_h || (header_height > 0 && idx > header_height)) {
+                it = g_global_requested_indices.erase(it);
             } else {
                 ++it;
             }
         }
+    }
 
-        // Trim the front of the oldest-first deque
-        // Also remove any corrupted indices beyond header height
-        while (!dq.empty() && (dq.front() <= (uint64_t)new_h ||
-               (header_height > 0 && dq.front() > header_height))) {
-            dq.pop_front();
+    // Per-peer cleanup - also needs lock protection
+    {
+        InflightLock lk(g_inflight_lock);
+        for (auto &kv : g_inflight_index_ts){
+            Sock s = kv.first;
+            auto &byidx = kv.second;
+            auto &dq = g_inflight_index_order[s];
+
+            // Remove from timestamp map any indices we must already have received
+            // OR any corrupted indices beyond header height
+            for (auto it = byidx.begin(); it != byidx.end(); ){
+                if (it->first <= (uint64_t)new_h) {
+                    it = byidx.erase(it);
+                } else if (header_height > 0 && it->first > header_height) {
+                    it = byidx.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
+            // Trim the front of the oldest-first deque
+            while (!dq.empty() && (dq.front() <= (uint64_t)new_h ||
+                   (header_height > 0 && dq.front() > header_height))) {
+                dq.pop_front();
+            }
         }
     }
 }
