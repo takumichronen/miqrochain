@@ -4416,6 +4416,12 @@ void P2P::process_pending_blocks() {
                     g_last_progress_ms = now_ms();
                     g_last_progress_height = chain_.height();
 
+                    // CRITICAL FIX: Clear from global tracking after successful reorg
+                    {
+                        InflightLock lk(g_inflight_lock);
+                        g_global_requested_indices.erase(next_height);
+                    }
+
                     // Update heights for next iteration
                     current_height = chain_.height();
                     next_height = current_height + 1;
@@ -4514,6 +4520,14 @@ void P2P::process_pending_blocks() {
 
             // Also try to connect any orphans that were waiting for this block
             try_connect_orphans(hexkey(it->second.hash));
+
+            // CRITICAL FIX: Clear from global tracking after successful processing!
+            // Without this, the index stays in g_global_requested_indices forever,
+            // causing fill_index_pipeline to skip it and stall sync.
+            {
+                InflightLock lk(g_inflight_lock);
+                g_global_requested_indices.erase(next_height);
+            }
 
             // Remove from pending queue
             pending_blocks_bytes_ -= it->second.raw.size();
