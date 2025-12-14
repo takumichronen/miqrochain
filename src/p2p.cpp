@@ -4351,13 +4351,38 @@ void P2P::queue_block_by_height(uint64_t height, const std::vector<uint8_t>& has
 void P2P::evict_pending_blocks_if_needed() {
     // Remove blocks that are already in chain or too far behind
     uint64_t current_height = chain_.height();
+    int64_t now = now_ms();
+
+    // CRITICAL FIX: Also remove blocks that have been waiting too long (30 seconds)
+    // If a block has been pending for 30s, its predecessor likely failed to arrive.
+    // Clear it from pending AND global so it can be re-requested.
+    static constexpr int64_t PENDING_BLOCK_TIMEOUT_MS = 30000;
 
     // Remove blocks at or below current height (already processed)
+    // Also remove blocks that have timed out waiting for predecessors
     auto it = pending_blocks_.begin();
     while (it != pending_blocks_.end()) {
+        bool should_remove = false;
+        bool timed_out = false;
+
         if (it->first <= current_height) {
+            should_remove = true;
+        } else if ((now - it->second.received_ms) > PENDING_BLOCK_TIMEOUT_MS) {
+            // Block has been waiting too long - predecessor never arrived
+            should_remove = true;
+            timed_out = true;
+        }
+
+        if (should_remove) {
+            uint64_t removed_height = it->first;
             pending_blocks_bytes_ -= it->second.raw.size();
             it = pending_blocks_.erase(it);
+
+            // If timed out, clear from global tracking so it can be re-requested
+            if (timed_out) {
+                InflightLock lk(g_inflight_lock);
+                g_global_requested_indices.erase(removed_height);
+            }
         } else {
             ++it;
         }
