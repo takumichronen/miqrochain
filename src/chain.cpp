@@ -700,14 +700,6 @@ bool Chain::get_header_hash_at_height(uint64_t target_height, std::vector<uint8_
     auto best_it = header_index_.find(best_header_key_);
     bool have_best_header = (!best_header_key_.empty() && best_it != header_index_.end());
 
-    // DIAG: Log early block lookups
-    if (target_height <= 5) {
-        log_info("[HASH-LOOKUP] height=" + std::to_string(target_height) +
-                " tip=" + std::to_string(tip_.height) +
-                " have_best=" + (have_best_header ? "yes" : "no") +
-                " best_height=" + (have_best_header ? std::to_string(best_it->second.height) : "N/A"));
-    }
-
     // Check if best header is on a DIFFERENT chain than our block tip
     // This happens during reorgs when we know about a longer chain via headers
     bool best_header_diverged = false;
@@ -733,44 +725,49 @@ bool Chain::get_header_hash_at_height(uint64_t target_height, std::vector<uint8_
     // If chains have diverged OR target is above our tip, use header chain
     if (best_header_diverged || target_height > tip_.height) {
         if (!have_best_header) {
-            if (target_height <= 5) log_warn("[HASH-LOOKUP] FAIL: no best header");
             return false;
         }
 
         // If target height is beyond best header, fail
         if (target_height > best_it->second.height) {
-            if (target_height <= 5) log_warn("[HASH-LOOKUP] FAIL: target > best_height");
             return false;
         }
 
-        // Walk backwards from best header to find target height
+        // PERFORMANCE FIX: O(1) lookup using height-to-hash index
+        // This replaces the O(n) chain walk that was causing O(n²) sync performance
+        auto height_it = header_height_index_.find(target_height);
+        if (height_it != header_height_index_.end()) {
+            out = height_it->second;
+            return true;
+        }
+
+        // Fallback: Walk backwards from best header to find target height
+        // This path is only used if header_height_index_ wasn't populated (shouldn't happen)
+        log_warn("[HASH-LOOKUP] O(1) index miss for height " + std::to_string(target_height) + ", falling back to O(n) walk");
+
         std::vector<uint8_t> current_hash = best_it->second.hash;
         uint64_t current_height = best_it->second.height;
 
         while (current_height > target_height) {
             auto it = header_index_.find(hk(current_hash));
             if (it == header_index_.end()) {
-                if (target_height <= 5) log_warn("[HASH-LOOKUP] FAIL: walk broke at height " + std::to_string(current_height));
                 return false;
             }
 
             current_hash = it->second.prev;
             current_height--;
+
+            // PERFORMANCE FIX: Populate the index as we walk (lazy fill)
+            // This ensures future lookups are O(1) even if initial population was missed
+            header_height_index_[current_height] = current_hash;
         }
 
         // Verify we found the right height
         auto final_it = header_index_.find(hk(current_hash));
-        if (final_it == header_index_.end()) {
-            if (target_height <= 5) log_warn("[HASH-LOOKUP] FAIL: final hash not found");
-            return false;
-        }
-        if (final_it->second.height != target_height) {
-            if (target_height <= 5) log_warn("[HASH-LOOKUP] FAIL: height mismatch " +
-                std::to_string(final_it->second.height) + " != " + std::to_string(target_height));
+        if (final_it == header_index_.end() || final_it->second.height != target_height) {
             return false;
         }
 
-        if (target_height <= 5) log_info("[HASH-LOOKUP] SUCCESS: found hash for height " + std::to_string(target_height));
         out = current_hash;
         return true;
     }
@@ -912,6 +909,10 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
     header_index_.emplace(key, std::move(m));
     set_header_full(key, h);  // THREAD-SAFE
 
+    // PERFORMANCE FIX: Populate height-to-hash index for O(1) lookups
+    // This avoids O(n) chain walk in get_header_hash_at_height()
+    header_height_index_[saved_height] = hh;
+
     // BITCOIN CORE FIX: Register header with ReorgManager for chain selection
     // This enables proper reorg handling when competing chains have more work
     {
@@ -971,6 +972,9 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
                     // Add to index
                     header_index_.emplace(orphan_key, std::move(om));
                     set_header_full(orphan_key, orphan);
+
+                    // PERFORMANCE FIX: Populate height-to-hash index for O(1) lookups
+                    header_height_index_[orphan_saved_height] = orphan_hash;
 
                     // BITCOIN CORE FIX: Register orphan header with ReorgManager
                     {
@@ -1924,6 +1928,8 @@ void Chain::rebuild_header_index_from_blocks(){
             m.work_sum = work_from_bits(blk.header.bits);
             header_index_.emplace(key, std::move(m));
             best_header_key_ = key;
+            // PERFORMANCE FIX: Populate height index for O(1) lookups
+            header_height_index_[0] = hh;
             // BITCOIN CORE FIX: Initialize ReorgManager with genesis during rebuild
             g_reorg.init_genesis(hh, blk.header.bits, blk.header.time);
             continue;
@@ -1962,6 +1968,9 @@ void Chain::rebuild_header_index_from_blocks(){
 
         header_index_.emplace(key, std::move(m));
         set_header_full(key, blk.header);  // THREAD-SAFE
+
+        // PERFORMANCE FIX: Populate height index for O(1) lookups
+        header_height_index_[rebuild_saved_height] = hh;
 
         // BITCOIN CORE FIX: Register rebuilt header with ReorgManager
         {
