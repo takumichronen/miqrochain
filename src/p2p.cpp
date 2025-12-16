@@ -5498,6 +5498,26 @@ void P2P::loop(){
                 int64_t stall_duration_ms = tnow - g_last_progress_ms;
                 log_info("P2P: stall detected - no height progress for " + std::to_string(stall_duration_ms / 1000) + "s (height=" + std::to_string(h) + ", peers=" + std::to_string(peers_.size()) + ")");
 
+                // STALL DIAGNOSTIC: Log detailed state to find WHY we're stalled
+                {
+                    InflightLock lk(g_inflight_lock);
+                    size_t global_inflight = g_global_requested_indices.size();
+                    int64_t oldest_age_ms = 0;
+                    uint64_t oldest_idx = 0;
+                    for (const auto& kv : g_global_requested_indices_ts) {
+                        int64_t age = tnow - kv.second;
+                        if (age > oldest_age_ms) {
+                            oldest_age_ms = age;
+                            oldest_idx = kv.first;
+                        }
+                    }
+                    log_info("P2P: STALL DIAGNOSTIC: global_inflight=" + std::to_string(global_inflight) +
+                             " oldest_request_age=" + std::to_string(oldest_age_ms) + "ms" +
+                             " oldest_idx=" + std::to_string(oldest_idx) +
+                             " next_needed=" + std::to_string(h + 1) +
+                             " header_height=" + std::to_string(chain_.best_header_height()));
+                }
+
                 // Log peer health during stalls (helps diagnose slow peers)
                 if (!g_logged_headers_done) {
                     std::string health_summary;
