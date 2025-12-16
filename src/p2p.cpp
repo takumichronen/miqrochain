@@ -1587,12 +1587,18 @@ static inline int64_t adaptive_index_timeout_ms(const miq::PeerState& ps){
     //      and slow down sync when seeds are under load
     // Near-tip: Need shorter timeouts for sub-second block propagation
 
-    // Unproven peers get moderate timeout during IBD, shorter after
-    // Don't be too aggressive - network latency varies
+    // Unproven peers get longer timeout during IBD, shorter after
+    // CRITICAL FIX: At IBD start, we have NO proof that ANY peer delivers blocks!
+    // Be very patient - give seeds 30s to respond before timing out.
+    // After we've received some blocks, we can be more aggressive.
     if (ps.total_blocks_received == 0) {
-        // During IBD: 10s to allow for slow seeds
+        // During early IBD: 30s to allow for slow/overloaded seeds
+        // During later IBD: 15s (we know block delivery works)
         // After IBD: 5s for faster detection
-        return !g_logged_headers_done ? 10000 : 5000;
+        if (!g_logged_headers_done) {
+            return 30000;  // 30s for unproven peers during IBD
+        }
+        return 5000;  // 5s after IBD
     }
 
     // Base on observed block delivery; halve it for indices (headers+lookup are lighter).
@@ -5410,23 +5416,40 @@ void P2P::loop(){
                     // DISCONNECT NON-RESPONSIVE PEERS
                     // If a peer has low health, 0 blocks delivered, and high inflight,
                     // they're wasting our request slots - disconnect and try other peers
-                    std::vector<std::string> dead_peer_ips;
+                    // CRITICAL FIX: At IBD start, ALL peers have 0 blocks - don't disconnect
+                    // until we've confirmed at least ONE peer can deliver blocks!
+                    bool any_peer_delivered = false;
                     for (const auto& kv : peers_) {
-                        const auto& ps = kv.second;
-                        if (!ps.verack_ok) continue;
-                        // Peer has health < 20%, never delivered a block, but has 64+ inflight
-                        bool is_non_responsive = (ps.health_score < 0.20) &&
-                                                 (ps.total_blocks_received == 0) &&
-                                                 (ps.inflight_blocks.size() >= 64);
-                        if (is_non_responsive) {
-                            log_warn("P2P: disconnecting non-responsive peer " + ps.ip +
-                                    " (health=" + std::to_string((int)(ps.health_score * 100)) + "%" +
-                                    " blocks=0 inflight=" + std::to_string(ps.inflight_blocks.size()) + ")");
-                            dead_peer_ips.push_back(ps.ip);
+                        if (kv.second.total_blocks_received > 0) {
+                            any_peer_delivered = true;
+                            break;
                         }
                     }
-                    for (const auto& ip : dead_peer_ips) {
-                        disconnect_peer(ip);
+
+                    // Only disconnect non-responsive peers if we have proof that block
+                    // delivery is working (at least one peer has delivered)
+                    // Also wait at least 60 seconds into IBD before disconnecting
+                    bool early_ibd = (h < 100);  // Still in very early IBD phase
+
+                    std::vector<std::string> dead_peer_ips;
+                    if (any_peer_delivered && !early_ibd) {
+                        for (const auto& kv : peers_) {
+                            const auto& ps = kv.second;
+                            if (!ps.verack_ok) continue;
+                            // Peer has health < 20%, never delivered a block, but has 64+ inflight
+                            bool is_non_responsive = (ps.health_score < 0.20) &&
+                                                     (ps.total_blocks_received == 0) &&
+                                                     (ps.inflight_blocks.size() >= 64);
+                            if (is_non_responsive) {
+                                log_warn("P2P: disconnecting non-responsive peer " + ps.ip +
+                                        " (health=" + std::to_string((int)(ps.health_score * 100)) + "%" +
+                                        " blocks=0 inflight=" + std::to_string(ps.inflight_blocks.size()) + ")");
+                                dead_peer_ips.push_back(ps.ip);
+                            }
+                        }
+                        for (const auto& ip : dead_peer_ips) {
+                            disconnect_peer(ip);
+                        }
                     }
                 }
 #if MIQ_ENABLE_HEADERS_FIRST
@@ -5685,34 +5708,36 @@ void P2P::loop(){
             // After IBD: use 2x for faster response
             int64_t base_timeout = ps.avg_block_delivery_ms;
 
-            // CRITICAL FIX: Unproven peers (0 deliveries) get SHORT timeouts (5s)
-            // This quickly identifies dead/non-responsive peers
-            // Proven peers get adaptive timeouts based on their performance
+            // CRITICAL FIX: At IBD start, we have NO proof any peer works!
+            // Give seeds MUCH longer time to respond - they may be overloaded.
+            // After we've confirmed block delivery works, we can be more aggressive.
             if (ps.total_blocks_received == 0) {
-                base_timeout = 5000;  // 5 seconds for unproven peers
+                // During IBD: 30s - we don't know if ANY peer works yet
+                // After IBD: 5s - block delivery should be proven by now
+                base_timeout = !g_logged_headers_done ? 30000 : 5000;
             }
 
             // Add buffer based on peer health (unhealthy peers get more time)
             double health_multiplier = 2.0 - ps.health_score; // 1.0 (healthy) to 2.0 (unhealthy)
 
-            // IBD multiplier: 3x during sync for proven peers, 1.5x after
-            // Unproven peers don't get IBD bonus - they need to prove themselves
+            // IBD multiplier: 2x during sync for proven peers, 1.5x after
+            // Unproven peers during IBD already get long base timeout
             double ibd_multiplier = (ps.total_blocks_received > 0 && !g_logged_headers_done) ? 2.0 : 1.0;
 
             // Final adaptive timeout
             int64_t adaptive_timeout = (int64_t)(base_timeout * health_multiplier * ibd_multiplier);
 
             // Timeout limits - balance between fast detection and network latency tolerance
-            // During IBD: be patient, network latency to seeds can be high
+            // During IBD: be VERY patient, seeds may be overloaded
             // After IBD: tighter timeouts for fast propagation
             int64_t min_timeout = 5000;
             int64_t max_timeout;
             if (ps.total_blocks_received == 0) {
-                // Unproven peers: 15s during IBD, 8s after (allow for network latency)
-                max_timeout = !g_logged_headers_done ? 15000 : 8000;
+                // Unproven peers: 45s during IBD (give them time!), 8s after
+                max_timeout = !g_logged_headers_done ? 45000 : 8000;
             } else {
-                // Proven peers: 20s during IBD, 15s after
-                max_timeout = !g_logged_headers_done ? 20000 : 15000;
+                // Proven peers: 30s during IBD, 15s after
+                max_timeout = !g_logged_headers_done ? 30000 : 15000;
             }
             adaptive_timeout = std::max(min_timeout, std::min(max_timeout, adaptive_timeout));
 
@@ -6756,15 +6781,25 @@ void P2P::loop(){
                                   }
                               }
                           } else if (gap_request_count <= 4) {
-                              // CRITICAL FIX: Attempts 3-4 (6-8 seconds): Request from MULTIPLE delivering peers
-                              // Don't wait 20+ seconds to try other peers!
+                              // CRITICAL FIX: Attempts 3-4 (6-8 seconds): Request from MULTIPLE peers
+                              // During IBD start, there are NO delivering peers yet, so must include all!
                               if (gap_request_count == 3) {
+                                  // Count how many delivering peers we have
+                                  int delivering_count = 0;
+                                  for (auto& kvp : peers_) {
+                                      if (kvp.second.verack_ok && kvp.second.total_blocks_received > 0)
+                                          delivering_count++;
+                                  }
+
                                   log_info("P2P: Gap at index " + std::to_string(next_needed) +
-                                           " - requesting from all delivering peers" +
+                                           " - requesting from " +
+                                           (delivering_count > 0 ? "delivering" : "ALL") + " peers" +
                                            (have_hash ? " [hash-based]" : " [index-based]"));
+
                                   for (auto& kvp : peers_) {
                                       if (!kvp.second.verack_ok) continue;
-                                      if (kvp.second.total_blocks_received == 0) continue;  // Only delivering peers
+                                      // Only filter to delivering peers if we HAVE delivering peers
+                                      if (delivering_count > 0 && kvp.second.total_blocks_received == 0) continue;
 
                                       if (have_hash) {
                                           const std::string key = hexkey(block_hash);
