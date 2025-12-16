@@ -6876,18 +6876,26 @@ void P2P::loop(){
                         }
                     }
 
-                    // TIME-GATED FALLBACK: After 30s with no headers, enable getbi
-                    // This is a LAST RESORT for bootstrap when headers are unavailable
+                    // TIME-GATED FALLBACK: After 30s with no header PROGRESS, enable fallback
+                    // CRITICAL FIX: Check for header STALL, not just header_height == 0
+                    // BUG: Previously only triggered when header_height == 0, so partial headers
+                    // (e.g., 2000 of 6000) would block fallback forever → inconsistent sync
                     int64_t waiting_ms = now - headers_wait_start_ms;
-                    if (waiting_ms > HEADERS_FALLBACK_TIMEOUT_MS && chain_.best_header_height() == 0) {
+                    const uint64_t current_hdr_height = chain_.best_header_height();
+                    const uint64_t target_height = g_max_known_peer_tip.load();
+                    bool headers_stalled = (waiting_ms > HEADERS_FALLBACK_TIMEOUT_MS);
+                    bool need_more_headers = (target_height > 0 && current_hdr_height < target_height);
+
+                    if (headers_stalled && need_more_headers) {
                         static int64_t last_fallback_log_ms = 0;
                         if (now - last_fallback_log_ms > 10000) {
                             last_fallback_log_ms = now;
-                            log_warn("[IBD] Headers timeout after " + std::to_string(waiting_ms/1000) +
-                                    "s - activating index-by-height fallback for bootstrap");
+                            log_warn("[IBD] Headers stalled at " + std::to_string(current_hdr_height) +
+                                    "/" + std::to_string(target_height) + " for " +
+                                    std::to_string(waiting_ms/1000) + "s - activating sync fallback");
                         }
 
-                        // Activate index-based sync for peers that support it
+                        // Activate sync for peers
                         for (auto& kvp : peers_) {
                             auto& pps = kvp.second;
                             if (!pps.verack_ok) continue;
@@ -6903,9 +6911,11 @@ void P2P::loop(){
 
                     g_sync_wants_active.store(true);
 
-                    // Reset wait timer when headers arrive
-                    if (chain_.best_header_height() > 0) {
-                        headers_wait_start_ms = 0;  // Reset - we got headers
+                    // Reset wait timer when headers ADVANCE (not just when > 0)
+                    static uint64_t last_reset_header_height = 0;
+                    if (current_hdr_height > last_reset_header_height) {
+                        last_reset_header_height = current_hdr_height;
+                        headers_wait_start_ms = now;  // Reset timer - headers are progressing
                     }
                 }
             }
