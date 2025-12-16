@@ -1586,7 +1586,13 @@ static inline int64_t adaptive_index_timeout_ms(const miq::PeerState& ps){
     // IBD: Need longer timeouts to avoid premature re-requests that waste bandwidth
     //      and slow down sync when seeds are under load
     // Near-tip: Need shorter timeouts for sub-second block propagation
-    //
+
+    // CRITICAL FIX: Unproven peers get SHORT timeout (3s)
+    // This quickly identifies dead/non-responsive peers instead of waiting forever
+    if (ps.total_blocks_received == 0) {
+        return 3000;  // 3 seconds for unproven peers - fail fast!
+    }
+
     // Base on observed block delivery; halve it for indices (headers+lookup are lighter).
     int64_t base = std::max<int64_t>(500, ps.avg_block_delivery_ms / 4);
 
@@ -1598,12 +1604,12 @@ static inline int64_t adaptive_index_timeout_ms(const miq::PeerState& ps){
     int64_t max_t;
     double ibd_mul;
     if (!g_logged_headers_done) {
-        // IBD mode: Be patient - seeds may be under load, avoid duplicate requests
-        ibd_mul = 3.0;  // More slack during IBD
-        max_t = 10000;  // 10s max during IBD - avoid re-request storms
+        // IBD mode: Be patient for PROVEN peers - seeds may be under load
+        ibd_mul = 2.0;  // Moderate slack during IBD
+        max_t = 8000;   // 8s max during IBD for proven peers
     } else if (ps.syncing) {
         // Active sync but past headers: moderate timeout
-        ibd_mul = 2.0;
+        ibd_mul = 1.5;
         max_t = 5000;  // 5s max during active sync
     } else {
         // Near-tip steady state: aggressive timeout for fast propagation
@@ -1623,7 +1629,7 @@ static inline int64_t adaptive_index_timeout_ms(const miq::PeerState& ps){
 static inline void update_peer_reputation(miq::PeerState& ps) {
     int64_t total_deliveries = ps.blocks_delivered_successfully + ps.blocks_failed_delivery;
     if (total_deliveries == 0) {
-        ps.reputation_score = 1.0;  // New peers start with perfect score
+        ps.reputation_score = 0.5;  // CRITICAL FIX: New peers start at 50% - was 1.0 which flooded unproven peers
         return;
     }
 
@@ -3111,7 +3117,7 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
     ps.avg_block_delivery_ms = 30000; // sane initial expectation (30s)
     ps.blocks_delivered_successfully = 0;
     ps.blocks_failed_delivery = 0;
-    ps.health_score = 1.0;
+    ps.health_score = 0.5;  // CRITICAL FIX: Start at 50% until proven - was 1.0 which gave unproven peers priority
     ps.last_block_received_ms = 0;
 
     // CRITICAL: Hold g_peers_mu while modifying peers_ to prevent data race with loop thread
@@ -3239,7 +3245,7 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
     ps.avg_block_delivery_ms = 30000;
     ps.blocks_delivered_successfully = 0;
     ps.blocks_failed_delivery = 0;
-    ps.health_score = 1.0;
+    ps.health_score = 0.5;  // CRITICAL FIX: Start at 50% until proven - was 1.0 which gave unproven peers priority
     ps.last_block_received_ms = 0;
 
     // CRITICAL: Hold g_peers_mu while modifying peers_ to prevent data race with loop thread
@@ -3729,6 +3735,17 @@ void P2P::fill_index_pipeline(PeerState& ps){
 
         // Use adaptive batch size, but cap at MIQ_INDEX_PIPELINE
         pipe = std::min(ps.adaptive_batch_size, (uint32_t)MIQ_INDEX_PIPELINE);
+
+        // CRITICAL FIX: Limit pipeline for UNPROVEN peers
+        // Don't flood new peers with 512 requests - start small until they prove themselves
+        // Unproven: max 16 requests. After 50 deliveries: full pipeline
+        if (ps.total_blocks_received == 0) {
+            pipe = std::min(pipe, 16u);  // New peer: max 16 requests until first delivery
+        } else if (ps.total_blocks_received < 50) {
+            // Ramping up: allow more as they deliver more
+            pipe = std::min(pipe, (uint32_t)(16 + ps.total_blocks_received));
+        }
+        // After 50+ deliveries: full pipeline allowed
     }
 
     // peer_is_index_capable is set by start_sync_with_peer
@@ -4720,11 +4737,18 @@ static void update_peer_performance(PeerState& ps, const std::string& block_hex,
             }
 
             // Update health score (0.0 = bad, 1.0 = good)
-            // Based on success rate and delivery speed
+            // CRITICAL FIX: Boost health on each delivery - don't just calculate ratio
+            // This ensures delivering peers gain health faster than they lose it on timeouts
             double success_rate = (double)ps.blocks_delivered_successfully /
                                  (ps.blocks_delivered_successfully + ps.blocks_failed_delivery + 1);
             double speed_factor = std::min(1.0, 30000.0 / std::max(1000.0, (double)ps.avg_block_delivery_ms));
-            ps.health_score = 0.7 * success_rate + 0.3 * speed_factor;
+            double calculated_health = 0.7 * success_rate + 0.3 * speed_factor;
+
+            // BOOST: Each delivery should increase health towards calculated value
+            // Use higher weight for calculated health to allow quick recovery from timeouts
+            ps.health_score = std::max(ps.health_score, calculated_health);
+            // Additional boost: add 5% for each delivery (up to 1.0)
+            ps.health_score = std::min(1.0, ps.health_score + 0.05);
         }
     }
 }
@@ -5659,19 +5683,32 @@ void P2P::loop(){
             // After IBD: use 2x for faster response
             int64_t base_timeout = ps.avg_block_delivery_ms;
 
+            // CRITICAL FIX: Unproven peers (0 deliveries) get SHORT timeouts (5s)
+            // This quickly identifies dead/non-responsive peers
+            // Proven peers get adaptive timeouts based on their performance
+            if (ps.total_blocks_received == 0) {
+                base_timeout = 5000;  // 5 seconds for unproven peers
+            }
+
             // Add buffer based on peer health (unhealthy peers get more time)
             double health_multiplier = 2.0 - ps.health_score; // 1.0 (healthy) to 2.0 (unhealthy)
 
-            // IBD multiplier: 3x during sync, 1.5x after
-            double ibd_multiplier = !g_logged_headers_done ? 3.0 : 1.5;
+            // IBD multiplier: 3x during sync for proven peers, 1.5x after
+            // Unproven peers don't get IBD bonus - they need to prove themselves
+            double ibd_multiplier = (ps.total_blocks_received > 0 && !g_logged_headers_done) ? 2.0 : 1.0;
 
             // Final adaptive timeout
             int64_t adaptive_timeout = (int64_t)(base_timeout * health_multiplier * ibd_multiplier);
 
             // CRITICAL FIX: Aggressive timeouts to prevent forks
-            // min 5s (fast retry), max 30s during IBD, max 15s after
-            int64_t min_timeout = 5000;   // Was 30000 - way too slow
-            int64_t max_timeout = !g_logged_headers_done ? 30000 : 15000;  // Was 180000/60000
+            // Unproven: 5s max. Proven during IBD: 20s max. Proven after IBD: 15s max.
+            int64_t min_timeout = 5000;
+            int64_t max_timeout;
+            if (ps.total_blocks_received == 0) {
+                max_timeout = 5000;  // Unproven: 5s max - fail fast
+            } else {
+                max_timeout = !g_logged_headers_done ? 20000 : 15000;  // Proven: 20s/15s
+            }
             adaptive_timeout = std::max(min_timeout, std::min(max_timeout, adaptive_timeout));
 
             // Check each inflight block for this peer
@@ -5680,7 +5717,11 @@ void P2P::loop(){
                 expired.emplace_back(bySock.first, kv.first);
                 // Track failed delivery for health score
                 ps.blocks_failed_delivery++;
-                ps.health_score = std::max(0.1, ps.health_score * 0.9); // Decay health on timeout
+                // CRITICAL FIX: Decay less aggressively for peers that have delivered blocks
+                // Unproven peers (0 deliveries) decay by 10% per timeout
+                // Proven peers decay by only 2% per timeout (they've shown they can deliver)
+                double decay_factor = (ps.total_blocks_received > 0) ? 0.98 : 0.90;
+                ps.health_score = std::max(0.1, ps.health_score * decay_factor);
               }
             }
           }
@@ -5817,7 +5858,9 @@ void P2P::loop(){
                 auto pit = peers_.find(e.s);
                 if (pit != peers_.end()) {
                     pit->second.blocks_failed_delivery++;
-                    pit->second.health_score = std::max(0.1, pit->second.health_score * 0.9);
+                    // Decay less aggressively for peers that have delivered blocks
+                    double decay_factor = (pit->second.total_blocks_received > 0) ? 0.98 : 0.90;
+                    pit->second.health_score = std::max(0.1, pit->second.health_score * decay_factor);
                 }
             }
 
@@ -6646,11 +6689,11 @@ void P2P::loop(){
                               }
                           }
 
-                          if (gap_request_count <= 10) {
-                              // First 10 attempts (20 seconds): request from best peer
-                              if (gap_request_count == 1 || gap_request_count == 5 || gap_request_count == 10) {
+                          if (gap_request_count <= 2) {
+                              // First 2 attempts (4 seconds): request from best peer only
+                              if (gap_request_count == 1) {
                                   log_info("P2P: Gap at index " + std::to_string(next_needed) +
-                                           " (attempt " + std::to_string(gap_request_count) + "/10)" +
+                                           " (attempt " + std::to_string(gap_request_count) + ")" +
                                            (have_hash ? " [using hash]" : " [using index]"));
                               }
 
@@ -6690,44 +6733,36 @@ void P2P::loop(){
                                       }
                                   }
                               }
-                          } else if (gap_request_count <= 15) {
-                              // After 10 attempts (20s): try other peers one at a time
-                              static size_t peer_round_robin = 0;
-                              std::vector<Sock> peers_to_try;
-                              for (auto& kvp : peers_) {
-                                  if (!kvp.second.verack_ok) continue;
-                                  peers_to_try.push_back(kvp.first);
-                              }
-                              if (!peers_to_try.empty() && have_hash) {
-                                  // HASH-BASED ONLY: Skip if we don't have header
-                                  peer_round_robin = (peer_round_robin + 1) % peers_to_try.size();
-                                  Sock try_peer = peers_to_try[peer_round_robin];
-                                  auto itT = peers_.find(try_peer);
-                                  if (itT != peers_.end()) {
+                          } else if (gap_request_count <= 4) {
+                              // CRITICAL FIX: Attempts 3-4 (6-8 seconds): Request from MULTIPLE delivering peers
+                              // Don't wait 20+ seconds to try other peers!
+                              if (gap_request_count == 3 && have_hash) {
+                                  log_info("P2P: Gap at index " + std::to_string(next_needed) +
+                                           " - requesting from all delivering peers");
+                                  const std::string key = hexkey(block_hash);
+                                  for (auto& kvp : peers_) {
+                                      if (!kvp.second.verack_ok) continue;
+                                      if (kvp.second.total_blocks_received == 0) continue;  // Only delivering peers
                                       auto msg = encode_msg("getb", block_hash);
-                                      if (send_or_close(try_peer, msg)) {
-                                          const std::string key = hexkey(block_hash);
-                                          itT->second.inflight_blocks.insert(key);
+                                      if (send_or_close(kvp.first, msg)) {
+                                          kvp.second.inflight_blocks.insert(key);
                                           g_global_inflight_blocks.insert(key);
-                                          // CRITICAL FIX: Track by index too
                                           {
                                               InflightLock lk(g_inflight_lock);
                                               g_global_requested_indices.insert(next_needed);
                                           }
-                                          g_inflight_index_ts[try_peer][next_needed] = tnow;
-                                          g_inflight_index_order[try_peer].push_back(next_needed);
+                                          g_inflight_index_ts[kvp.first][next_needed] = tnow;
+                                          g_inflight_index_order[kvp.first].push_back(next_needed);
                                       }
-                                      log_info("P2P: Gap retry " + std::to_string(next_needed) +
-                                               " from peer " + itT->second.ip + " [hash-based]");
                                   }
                               }
                           } else {
-                              // After 15 attempts (30s): Broadcast to ALL peers
-                              // But only do this ONCE per gap, then give up and wait
-                              if (gap_request_count == 16 && have_hash) {
+                              // CRITICAL FIX: Attempt 5+ (10 seconds): Broadcast to ALL peers
+                              // Don't wait 30+ seconds - if delivering peers don't have it, try everyone!
+                              if (gap_request_count == 5 && have_hash) {
                                   // HASH-BASED BROADCAST: Only if we have the header
                                   log_warn("P2P: Gap at index " + std::to_string(next_needed) +
-                                           " - broadcasting to ALL peers (final attempt) [hash-based]");
+                                           " - broadcasting to ALL peers (10s stuck) [hash-based]");
 
                                   int sent_count = 0;
                                   const std::string key = hexkey(block_hash);
