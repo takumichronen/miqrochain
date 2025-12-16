@@ -3797,6 +3797,15 @@ void P2P::fill_index_pipeline(PeerState& ps){
         return;
     }
 
+    // CRITICAL FIX: Cap inflight for ALL peers to prevent overwhelming the network
+    // With 142+ inflight requests, even good peers can't keep up and health drops
+    // This caused the ONLY delivering peer to have 11% health while delivering 705 blocks!
+    if (ps.inflight_index >= 64) {
+        // Even proven peers should not have more than 64 requests pending
+        // This prevents overwhelming the peer and causing mass timeouts
+        return;
+    }
+
     // NOTE: Removed health-based throttle - it was too aggressive and caused sync stalls
     // A peer that has delivered blocks should continue getting requests even if health is low
     // The timeout mechanism will handle non-responsive peers
@@ -4755,8 +4764,12 @@ static void update_peer_performance(PeerState& ps, const std::string& block_hex,
             // BOOST: Each delivery should increase health towards calculated value
             // Use higher weight for calculated health to allow quick recovery from timeouts
             ps.health_score = std::max(ps.health_score, calculated_health);
-            // Additional boost: add 5% for each delivery (up to 1.0)
-            ps.health_score = std::min(1.0, ps.health_score + 0.05);
+            // CRITICAL FIX: Boost health MORE on each delivery (15% instead of 5%)
+            // With 64 max inflight, even if 50% timeout we need deliveries to maintain health
+            // 32 deliveries * 15% = 480% boost, capped at 1.0
+            // 32 timeouts * 0.99 decay = health * 0.73 (only 27% loss)
+            // Net result: delivering peers maintain high health
+            ps.health_score = std::min(1.0, ps.health_score + 0.15);
         }
     }
 }
@@ -5749,8 +5762,9 @@ void P2P::loop(){
                 ps.blocks_failed_delivery++;
                 // CRITICAL FIX: Decay less aggressively for peers that have delivered blocks
                 // Unproven peers (0 deliveries) decay by 10% per timeout
-                // Proven peers decay by only 2% per timeout (they've shown they can deliver)
-                double decay_factor = (ps.total_blocks_received > 0) ? 0.98 : 0.90;
+                // Proven peers decay by only 0.5% per timeout (they've shown they can deliver)
+                // With 15% boost per delivery, a peer delivering 50% of requests will maintain health
+                double decay_factor = (ps.total_blocks_received > 0) ? 0.995 : 0.90;
                 ps.health_score = std::max(0.1, ps.health_score * decay_factor);
               }
             }
@@ -5889,7 +5903,8 @@ void P2P::loop(){
                 if (pit != peers_.end()) {
                     pit->second.blocks_failed_delivery++;
                     // Decay less aggressively for peers that have delivered blocks
-                    double decay_factor = (pit->second.total_blocks_received > 0) ? 0.98 : 0.90;
+                    // With 15% boost per delivery and 0.5% decay, delivering peers maintain health
+                    double decay_factor = (pit->second.total_blocks_received > 0) ? 0.995 : 0.90;
                     pit->second.health_score = std::max(0.1, pit->second.health_score * decay_factor);
                 }
             }
