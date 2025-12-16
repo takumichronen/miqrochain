@@ -1587,16 +1587,15 @@ static inline int64_t adaptive_index_timeout_ms(const miq::PeerState& ps){
     //      and slow down sync when seeds are under load
     // Near-tip: Need shorter timeouts for sub-second block propagation
 
-    // Unproven peers get longer timeout during IBD, shorter after
-    // CRITICAL FIX: At IBD start, we have NO proof that ANY peer delivers blocks!
-    // Be very patient - give seeds 30s to respond before timing out.
-    // After we've received some blocks, we can be more aggressive.
+    // Unproven peers get moderate timeout during IBD, shorter after
+    // STALL FIX: 30s was WAY too long! If a peer doesn't respond in 10s, they're broken.
+    // The "stale request bypass" in fill_index_pipeline will send fresh requests,
+    // but we still need reasonable timeouts to clean up dead requests.
     if (ps.total_blocks_received == 0) {
-        // During early IBD: 30s to allow for slow/overloaded seeds
-        // During later IBD: 15s (we know block delivery works)
+        // During IBD: 10s max - if they can't respond in 10s, something's wrong
         // After IBD: 5s for faster detection
         if (!g_logged_headers_done) {
-            return 30000;  // 30s for unproven peers during IBD
+            return 10000;  // 10s for unproven peers during IBD (was 30s!)
         }
         return 5000;  // 5s after IBD
     }
@@ -3800,10 +3799,32 @@ void P2P::fill_index_pipeline(PeerState& ps){
     // CRITICAL FIX: Cap inflight for ALL peers to prevent overwhelming the network
     // With 142+ inflight requests, even good peers can't keep up and health drops
     // This caused the ONLY delivering peer to have 11% health while delivering 705 blocks!
-    if (ps.inflight_index >= 64) {
-        // Even proven peers should not have more than 64 requests pending
-        // This prevents overwhelming the peer and causing mass timeouts
-        return;
+    //
+    // STALL FIX: Don't count STALE requests toward the cap!
+    // If requests have been pending for > 5 seconds, they're likely dead.
+    // Allow fresh requests to be sent while waiting for stale ones to timeout.
+    // This prevents the "128 inflight, 0 received" deadlock where we wait 30+ seconds.
+    {
+        const int64_t tnow = now_ms();
+        const int64_t STALE_AGE_MS = 5000;  // 5 seconds = stale
+
+        // Count only FRESH requests (< 5 seconds old)
+        uint32_t fresh_inflight = 0;
+        InflightLock lk(g_inflight_lock);
+        auto it = g_inflight_index_ts.find((Sock)ps.sock);
+        if (it != g_inflight_index_ts.end()) {
+            for (const auto& kv : it->second) {
+                if (tnow - kv.second < STALE_AGE_MS) {
+                    fresh_inflight++;
+                }
+            }
+        }
+
+        // Use fresh count for cap, not total inflight
+        // This allows sending new requests even when old ones are stale
+        if (fresh_inflight >= 64) {
+            return;
+        }
     }
 
     // NOTE: Removed health-based throttle - it was too aggressive and caused sync stalls
@@ -5727,13 +5748,13 @@ void P2P::loop(){
             // After IBD: use 2x for faster response
             int64_t base_timeout = ps.avg_block_delivery_ms;
 
-            // CRITICAL FIX: At IBD start, we have NO proof any peer works!
-            // Give seeds MUCH longer time to respond - they may be overloaded.
-            // After we've confirmed block delivery works, we can be more aggressive.
+            // STALL FIX: At IBD start, use moderate timeout - 30s was WAY too long!
+            // If a peer can't deliver a block in 10s, they're broken.
+            // The "stale request bypass" will send fresh requests after 5s anyway.
             if (ps.total_blocks_received == 0) {
-                // During IBD: 30s - we don't know if ANY peer works yet
+                // During IBD: 10s - reasonable time for any working peer
                 // After IBD: 5s - block delivery should be proven by now
-                base_timeout = !g_logged_headers_done ? 30000 : 5000;
+                base_timeout = !g_logged_headers_done ? 10000 : 5000;
             }
 
             // Add buffer based on peer health (unhealthy peers get more time)
@@ -5746,17 +5767,17 @@ void P2P::loop(){
             // Final adaptive timeout
             int64_t adaptive_timeout = (int64_t)(base_timeout * health_multiplier * ibd_multiplier);
 
-            // Timeout limits - balance between fast detection and network latency tolerance
-            // During IBD: be VERY patient, seeds may be overloaded
-            // After IBD: tighter timeouts for fast propagation
-            int64_t min_timeout = 5000;
+            // Timeout limits - STALL FIX: Much shorter timeouts to prevent deadlock
+            // The "stale request bypass" sends fresh requests after 5s anyway
+            int64_t min_timeout = 3000;  // 3s minimum
             int64_t max_timeout;
             if (ps.total_blocks_received == 0) {
-                // Unproven peers: 45s during IBD (give them time!), 8s after
-                max_timeout = !g_logged_headers_done ? 45000 : 8000;
+                // Unproven peers: 15s during IBD, 8s after
+                // 45s was causing 30+ second stalls!
+                max_timeout = !g_logged_headers_done ? 15000 : 8000;
             } else {
-                // Proven peers: 30s during IBD, 15s after
-                max_timeout = !g_logged_headers_done ? 30000 : 15000;
+                // Proven peers: 20s during IBD, 15s after
+                max_timeout = !g_logged_headers_done ? 20000 : 15000;
             }
             adaptive_timeout = std::max(min_timeout, std::min(max_timeout, adaptive_timeout));
 
@@ -6161,10 +6182,11 @@ void P2P::loop(){
               const uint64_t max_peer = g_max_known_peer_tip.load();
               const uint64_t target_height = std::max(header_height, max_peer);
 
-              // IBD FIX: Use different recovery thresholds for IBD vs near-tip
-              // IBD: 30 seconds - be patient, blocks are downloading in parallel
+              // STALL FIX: Shorter recovery during IBD - 30s was too long!
+              // With "stale request bypass", we send fresh requests after 5s anyway.
+              // IBD: 15 seconds - reasonable time to detect true stalls
               // Near-tip: 2 seconds - fast recovery for propagation latency
-              const int64_t STALL_RECOVERY_MS = miq::is_ibd_mode() ? 30000 : 2000;
+              const int64_t STALL_RECOVERY_MS = miq::is_ibd_mode() ? 15000 : 2000;
 
               // Check if we're stalled: no progress, not fully synced, have peers
               if (!peers_.empty() &&
