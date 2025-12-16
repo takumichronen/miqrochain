@@ -1378,6 +1378,78 @@ static void remove_file_scope_inflight(const std::string& hash) {
 }
 
 static std::unordered_map<Sock,int> g_index_timeouts;
+
+// ============================================================================
+// IP REPUTATION HISTORY - Persists across reconnections
+// ============================================================================
+// Problem: Bad peers disconnect and reconnect with fresh health=100%, wasting slots.
+// Solution: Track per-IP history that survives reconnections.
+struct IPReputationHistory {
+    int64_t  total_blocks_delivered{0};    // Lifetime blocks from this IP
+    int64_t  total_blocks_failed{0};       // Lifetime failures from this IP
+    int64_t  total_connections{0};         // How many times this IP connected
+    int64_t  last_disconnect_ms{0};        // When they last disconnected
+    double   last_reputation{1.0};         // Last known reputation score
+    bool     proven_good{false};           // Has this IP ever delivered >100 blocks?
+};
+static std::unordered_map<std::string, IPReputationHistory> g_ip_history;
+static std::mutex g_ip_history_mutex;
+
+// Get starting batch size for an IP based on history
+static inline uint32_t get_ip_starting_batch(const std::string& ip) {
+    std::lock_guard<std::mutex> lk(g_ip_history_mutex);
+    auto it = g_ip_history.find(ip);
+    if (it == g_ip_history.end()) {
+        // Never seen this IP before - start VERY conservatively
+        return 32;  // Start with small batch
+    }
+    const auto& hist = it->second;
+    if (hist.proven_good) {
+        // This IP has delivered >100 blocks in the past - trust it
+        return 128;
+    }
+    if (hist.total_blocks_delivered == 0 && hist.total_connections > 0) {
+        // Has connected before but NEVER delivered anything - very suspicious
+        return 16;
+    }
+    // Has some history - scale based on past success rate
+    int64_t total = hist.total_blocks_delivered + hist.total_blocks_failed;
+    if (total == 0) return 32;
+    double success_rate = (double)hist.total_blocks_delivered / (double)total;
+    if (success_rate > 0.9) return 128;
+    if (success_rate > 0.7) return 64;
+    if (success_rate > 0.5) return 32;
+    return 16;  // Poor history
+}
+
+// Record that a peer from this IP is connecting
+static inline void record_ip_connect(const std::string& ip) {
+    std::lock_guard<std::mutex> lk(g_ip_history_mutex);
+    g_ip_history[ip].total_connections++;
+}
+
+// Record block delivery success/failure for IP history
+static inline void record_ip_block_result(const std::string& ip, bool success) {
+    std::lock_guard<std::mutex> lk(g_ip_history_mutex);
+    auto& hist = g_ip_history[ip];
+    if (success) {
+        hist.total_blocks_delivered++;
+        if (hist.total_blocks_delivered >= 100) {
+            hist.proven_good = true;
+        }
+    } else {
+        hist.total_blocks_failed++;
+    }
+}
+
+// Record peer disconnect and save final reputation
+static inline void record_ip_disconnect(const std::string& ip, double final_reputation) {
+    std::lock_guard<std::mutex> lk(g_ip_history_mutex);
+    auto& hist = g_ip_history[ip];
+    hist.last_disconnect_ms = now_ms();
+    hist.last_reputation = final_reputation;
+}
+
 static inline void mark_index_timeout(Sock s){
     // CRITICAL FIX: Only increment the counter here, don't set g_peer_index_capable!
     // The demotion should happen ONLY in the dedicated demotion loop (line ~5305)
@@ -1652,19 +1724,38 @@ static inline void update_peer_reputation(miq::PeerState& ps) {
 
 // Calculate adaptive batch size based on peer reputation and network conditions
 static inline uint32_t calculate_adaptive_batch_size(const miq::PeerState& ps) {
-    // AGGRESSIVE: Much larger batch sizes for FAST sync
-    // For small chains (5-10k blocks), sync should be nearly instant
+    // CRITICAL FIX: Don't blindly trust new peers with huge batches!
+    // Problem: New peers get rep=1.0, get 256 requests, never deliver, waste slots.
+    // Solution: Start with IP-based limit, only ramp up AFTER peer proves itself.
 
     double rep = ps.reputation_score;
     uint32_t batch_size;
 
-    // During IBD: MAXIMUM AGGRESSION - request as many blocks as possible
+    // STEP 1: Check if peer has proven itself THIS SESSION
+    // A peer is "proven" if they've delivered at least 10 blocks
+    bool peer_proven_this_session = (ps.blocks_delivered_successfully >= 10);
+
+    // STEP 2: Get IP-based starting limit (survives reconnects)
+    uint32_t ip_limit = get_ip_starting_batch(ps.ip);
+
+    // During IBD: adaptive based on proven status
     if (!g_logged_headers_done) {
-        // IBD mode: huge batches for fast sync
-        if (rep >= 0.5) {
-            batch_size = 256;  // Request 256 blocks at once during IBD
+        if (peer_proven_this_session) {
+            // Peer has proven themselves this session - allow large batches
+            if (rep >= 0.5) {
+                batch_size = 256;
+            } else {
+                batch_size = 128;
+            }
         } else {
-            batch_size = 128;  // Even poor peers get large batches during IBD
+            // Peer has NOT proven themselves yet - use IP history limit
+            // This prevents reconnecting bad peers from immediately getting 256 requests
+            batch_size = ip_limit;
+
+            // Allow gradual ramp up based on current session delivery
+            if (ps.blocks_delivered_successfully >= 5) {
+                batch_size = std::min(batch_size * 2, (uint32_t)128);
+            }
         }
     } else {
         // Post-IBD: normal operation with reasonable batches
@@ -3148,6 +3239,9 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
 
     log_info("Peer: connected → " + ps.ip);
 
+    // CRITICAL: Track IP connection for reputation history
+    record_ip_connect(ps.ip);
+
     // Gate first, then mark loopback (so flag actually sticks)
     gate_on_connect(s);
     if (parse_ipv4(ps.ip, be_ip)) {
@@ -3260,6 +3354,9 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
     }
 
     log_info("P2P: inbound peer " + ip);
+
+    // CRITICAL: Track IP connection for reputation history
+    record_ip_connect(ip);
 
     // Gate first, then mark loopback (critical for localhost wallet)
     gate_on_connect(c);
@@ -4704,6 +4801,9 @@ static void update_peer_performance(PeerState& ps, const std::string& block_hex,
             ps.last_block_received_ms = now_ms;
             ps.blocks_delivered_successfully++;
 
+            // CRITICAL: Record block success in IP history (survives reconnects)
+            record_ip_block_result(ps.ip, true);
+
             // Calculate exponential moving average (EMA) with alpha=0.2
             // This gives more weight to recent deliveries
             if (ps.total_blocks_received == 1) {
@@ -5162,6 +5262,8 @@ void P2P::loop(){
                          g_peer_index_capable[s] = false;
                          g_trickle_last_ms[s] = 0;
                          log_info("P2P: outbound (addrman) " + ps.ip);
+                         // CRITICAL: Track IP connection for reputation history
+                         record_ip_connect(ps.ip);
                          miq_set_keepalive(s);
                          gate_on_connect(s);
                          if (is_v4) gate_set_loopback(s, is_loopback_be(be_ip));
@@ -5235,6 +5337,8 @@ void P2P::loop(){
                                 g_trickle_last_ms[s] = 0;
 
                                 log_info("P2P: outbound to known " + ps.ip);
+                                // CRITICAL: Track IP connection for reputation history
+                                record_ip_connect(ps.ip);
                                 gate_on_connect(s);
                                 miq_set_keepalive(s);
                                 gate_set_loopback(s, is_loopback_be(pick));
@@ -5702,6 +5806,8 @@ void P2P::loop(){
                 // Track failed delivery for health score
                 ps.blocks_failed_delivery++;
                 ps.health_score = std::max(0.1, ps.health_score * 0.9); // Decay health on timeout
+                // CRITICAL: Record block failure in IP history (survives reconnects)
+                record_ip_block_result(ps.ip, false);
               }
             }
           }
@@ -5809,6 +5915,8 @@ void P2P::loop(){
                 // to index requests to keep high health while actively-delivering peers got punished
                 ps.blocks_failed_delivery++;
                 ps.health_score = std::max(0.1, ps.health_score * 0.9);
+                // CRITICAL: Record block failure in IP history (survives reconnects)
+                record_ip_block_result(ps.ip, false);
               } else {
                 break; // front is still within timeout window
               }
@@ -7709,6 +7817,9 @@ void P2P::loop(){
                 // Log peer disconnection
                 log_info("Peer: disconnected ← " + ps_old.ip + " (remaining_peers=" + std::to_string(peers_.size() - 1) + ")");
 
+                // CRITICAL: Save peer's reputation to IP history before disconnect
+                record_ip_disconnect(ps_old.ip, ps_old.reputation_score);
+
                 // CRITICAL FIX: Record backoff time to prevent rapid reconnection
                 {
                     std::lock_guard<std::mutex> lk_backoff(g_reconnect_backoff_mu);
@@ -7958,6 +8069,11 @@ void P2P::loop(){
                         ps.verack_ok = true;
                         g_index_timeouts[(Sock)s] = 0;
 
+                        // CRITICAL FIX: Track whether we received verack from peer
+                        // Peers that don't send verack are suspicious and should NOT receive
+                        // block requests until they prove they're working
+                        ps.received_verack = strict_handshake;
+
                         // ================================================================
                         // BULLETPROOF FORK VERIFICATION
                         // Before syncing, verify peer is on the same chain by checking
@@ -8007,13 +8123,27 @@ void P2P::loop(){
                         } else {
                             // No checkpoint blocks yet (initial sync) - allow sync without verification
                             // Once we sync past checkpoints, new peers will be verified
-                            ps.fork_verified = true;  // Trust during initial sync
-                            g_peer_index_capable[(Sock)s] = true;
-                            ps.syncing = true;
-                            ps.next_index = our_height + 1;
-                            fill_index_pipeline(ps);
-                            log_info("P2P: Initial sync - skipping fork verification for " + ps.ip +
-                                    " (no checkpoint blocks yet)");
+
+                            // CRITICAL FIX: Do NOT start block sync with peers that haven't sent verack!
+                            // BUG: Peers that don't send verack were getting assigned 256 block requests,
+                            // never responding, getting disconnected, then reconnecting with fresh
+                            // health=100% and getting more requests. This caused sync stalls.
+                            if (!ps.received_verack) {
+                                log_warn("P2P: NOT starting sync with " + ps.ip +
+                                        " - peer hasn't sent verack (compatibility mode only)");
+                                // Allow basic communication but don't assign block requests
+                                ps.fork_verified = false;
+                                g_peer_index_capable[(Sock)s] = false;
+                                ps.syncing = false;
+                            } else {
+                                ps.fork_verified = true;  // Trust during initial sync
+                                g_peer_index_capable[(Sock)s] = true;
+                                ps.syncing = true;
+                                ps.next_index = our_height + 1;
+                                fill_index_pipeline(ps);
+                                log_info("P2P: Initial sync - skipping fork verification for " + ps.ip +
+                                        " (no checkpoint blocks yet)");
+                            }
                         }
 
                         const int64_t hs_ms = now_ms() - gg.t_conn_ms;
@@ -8854,6 +8984,8 @@ void P2P::loop(){
 
                             // Track as failed delivery for reputation scoring
                             ps.blocks_failed_delivery++;
+                            // CRITICAL: Record block failure in IP history (survives reconnects)
+                            record_ip_block_result(ps.ip, false);
 
                             // CRITICAL FIX: Don't retry if index exceeds header height
                             // This prevents endless retry loops for non-existent blocks
@@ -9022,6 +9154,9 @@ void P2P::loop(){
                             ps.total_block_delivery_time_ms += delivery_time_ms;
                             ps.total_blocks_received++;
                             ps.total_block_bytes_received += m.payload.size();
+
+                            // CRITICAL: Record block success in IP history (survives reconnects)
+                            record_ip_block_result(ps.ip, true);
 
                             // CRITICAL FIX: Recalculate health score on successful delivery
                             // Previously only timeouts affected health (decay), but deliveries didn't restore it
@@ -9900,6 +10035,8 @@ void P2P::loop(){
                     if (tnow - last_probe >= (int64_t)MIQ_P2P_STALL_RETRY_MS) {
                         // Track failed delivery (timeout) for reputation scoring
                         ps.blocks_failed_delivery++;
+                        // CRITICAL: Record block failure in IP history (survives reconnects)
+                        record_ip_block_result(ps.ip, false);
 
                         // Re-request the same *oldest* index on this peer (retry only; do NOT inflate inflight count).
                         request_block_index(ps, oldest_inflight);
@@ -10046,6 +10183,9 @@ void P2P::loop(){
 
                 // Always log peer disconnection for visibility
                 log_info("Peer: disconnected ← " + ip + " (remaining_peers=" + std::to_string(peers_.size() - 1) + ")");
+
+                // CRITICAL: Save peer's reputation to IP history before disconnect
+                record_ip_disconnect(ip, it->second.reputation_score);
 
                 if (it->second.sock != MIQ_INVALID_SOCK) {
                     CLOSESOCK(s);
