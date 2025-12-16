@@ -5356,21 +5356,20 @@ void P2P::loop(){
                     }
 
                     // DISCONNECT NON-RESPONSIVE PEERS
-                    // If a peer has low health and high inflight, they're wasting our request slots
-                    // Disconnect them so we can redistribute requests to working peers
+                    // If a peer has low health, 0 blocks delivered, and high inflight,
+                    // they're wasting our request slots - disconnect and try other peers
                     std::vector<std::string> dead_peer_ips;
                     for (const auto& kv : peers_) {
                         const auto& ps = kv.second;
                         if (!ps.verack_ok) continue;
-                        // Peer has health < 20% with 64+ inflight requests stuck
-                        // This catches peers that became unresponsive AFTER delivering some blocks
+                        // Peer has health < 20%, never delivered a block, but has 64+ inflight
                         bool is_non_responsive = (ps.health_score < 0.20) &&
+                                                 (ps.total_blocks_received == 0) &&
                                                  (ps.inflight_blocks.size() >= 64);
                         if (is_non_responsive) {
                             log_warn("P2P: disconnecting non-responsive peer " + ps.ip +
                                     " (health=" + std::to_string((int)(ps.health_score * 100)) + "%" +
-                                    " blocks=" + std::to_string(ps.total_blocks_received) +
-                                    " inflight=" + std::to_string(ps.inflight_blocks.size()) + ")");
+                                    " blocks=0 inflight=" + std::to_string(ps.inflight_blocks.size()) + ")");
                             dead_peer_ips.push_back(ps.ip);
                         }
                     }
