@@ -4997,23 +4997,23 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
             update_peer_performance(pit->second, hexkey(bh), g_inflight_block_ts, now_ms());
 
             // CRITICAL FIX: Decrement inflight_index when hash-based block arrives!
-            // BUG: fill_index_pipeline sends getb (hash-based) requests but increments inflight_index.
-            // When the "block" response arrives, inflight_index was NEVER decremented!
-            // This caused inflight_index to grow unbounded, blocking all new requests.
-            // The only decrement was in the "bi" handler (line ~8994), but hash-based
-            // requests return "block" messages, not "bi" messages.
-            if (pit->second.syncing && pit->second.inflight_index > 0) {
-                pit->second.inflight_index--;
-            }
-
-            // Also clear from index-based tracking maps (if this was a hash-based request for an index)
+            // CRITICAL FIX: Clear this block from ALL peers' inflight tracking!
+            // With speculative parallel requests, multiple peers may have requested
+            // the same block. When it arrives, ALL peers need their inflight_index
+            // decremented, not just the delivering peer.
             {
                 InflightLock lk(g_inflight_lock);
-                // Clear from g_inflight_index_ts for this peer
-                auto idx_it = g_inflight_index_ts.find(sock);
-                if (idx_it != g_inflight_index_ts.end()) {
-                    // The block at block_height was delivered - remove from tracking
-                    idx_it->second.erase(block_height);
+                // Clear from ALL peers' tracking (not just delivering peer)
+                for (auto& idx_kv : g_inflight_index_ts) {
+                    Sock peer_sock = idx_kv.first;
+                    auto& peer_indices = idx_kv.second;
+                    if (peer_indices.erase(block_height) > 0) {
+                        // This peer had this block inflight - decrement their counter
+                        auto peer_it = peers_.find(peer_sock);
+                        if (peer_it != peers_.end() && peer_it->second.inflight_index > 0) {
+                            peer_it->second.inflight_index--;
+                        }
+                    }
                 }
                 // Clear from global requested indices
                 clear_global_requested_index(block_height);
