@@ -6350,7 +6350,17 @@ void P2P::loop(){
               static int64_t last_gap_check_ms = 0;
               static uint64_t last_gap_index = 0;
               static int gap_request_count = 0;
+              static int64_t last_pending_evict_ms = 0;
               const int64_t tnow = now_ms();
+
+              // CRITICAL FIX: Periodically evict timed-out pending blocks
+              // Previously this was only called when new blocks arrived, which
+              // caused sync to completely stall - pending blocks would never
+              // timeout because no new blocks could arrive.
+              if (tnow - last_pending_evict_ms > 5000) {
+                  last_pending_evict_ms = tnow;
+                  evict_pending_blocks_if_needed();
+              }
 
               // AGGRESSIVE: Check every 100ms to detect gaps immediately
               // Bitcoin Core-aligned: missing blocks must be detected within bounded time
@@ -8847,23 +8857,32 @@ void P2P::loop(){
                                 }
                             }
 
-                            // Additional cleanup: Try to identify and clear the specific index from per-peer tracking
+                            // CRITICAL FIX: Calculate delivered_idx FIRST and ALWAYS clear from global
+                            // This was the root cause of sync stoppage - indices got stuck in global
+                            // tracking when per-peer tracking was empty or out of sync.
+                            uint64_t delivered_idx = 0;
+
+                            // Method 1: Calculate from parent header height
+                            int64_t parent_height = chain_.get_header_height(hb.header.prev_hash);
+                            if (parent_height >= 0) {
+                                delivered_idx = (uint64_t)(parent_height + 1);
+                            }
+
+                            // Method 2: Use chain growth
+                            if (delivered_idx == 0 && new_height > old_height) {
+                                delivered_idx = new_height;
+                            }
+
+                            // CRITICAL FIX: ALWAYS clear delivered_idx from global tracking!
+                            // We received the block, so we don't need it in global anymore.
+                            // Previously this was conditional on per-peer tracking, causing stalls.
+                            if (delivered_idx != 0) {
+                                InflightLock lk(g_inflight_lock);
+                                g_global_requested_indices.erase(delivered_idx);
+                            }
+
+                            // Additional cleanup: Try to clear from per-peer tracking too
                             if (!g_inflight_index_ts[(Sock)s].empty()) {
-                                // Try to identify which specific index this peer delivered
-                                // so we can update per-peer tracking accurately
-                                uint64_t delivered_idx = 0;
-
-                                // Method 1: Calculate from parent header height
-                                int64_t parent_height = chain_.get_header_height(hb.header.prev_hash);
-                                if (parent_height >= 0) {
-                                    delivered_idx = (uint64_t)(parent_height + 1);
-                                }
-
-                                // Method 2: Use chain growth
-                                if (delivered_idx == 0 && new_height > old_height) {
-                                    delivered_idx = new_height;
-                                }
-
                                 // Verify this index is in THIS peer's inflight tracking
                                 bool found_in_peer = false;
                                 if (delivered_idx != 0) {
@@ -8882,12 +8901,6 @@ void P2P::loop(){
                                     if (dq_it != dq_idx.end()) {
                                         dq_idx.erase(dq_it);
                                     }
-                                    // CRITICAL FIX: Also clear from global tracking!
-                                    // This was missing - indices stayed in global forever!
-                                    {
-                                        InflightLock lk(g_inflight_lock);
-                                        g_global_requested_indices.erase(delivered_idx);
-                                    }
                                     cleared = true;
                                 }
 
@@ -8897,42 +8910,28 @@ void P2P::loop(){
                                     uint64_t oldest = g_inflight_index_order[(Sock)s].front();
                                     g_inflight_index_order[(Sock)s].pop_front();
                                     g_inflight_index_ts[(Sock)s].erase(oldest);
-                                    // CRITICAL FIX: ALWAYS clear from global when clearing from peer
-                                    // The old code only cleared if oldest <= new_height, which fails for orphans!
-                                    // If we received a block, we don't need this index in global anymore.
+                                    // Also clear from global (might be different from delivered_idx)
                                     {
                                         InflightLock lk(g_inflight_lock);
                                         g_global_requested_indices.erase(oldest);
                                     }
                                 }
-
-                                // NOTE: inflight_index decrement happens earlier (line ~8790) unconditionally
-                                // when ps.syncing is true. No need to decrement again here.
-
-                                // CRITICAL FIX: Reset timeout counter AND re-enable the peer!
-                                // The peer just successfully delivered a block, proving it works.
-                                // Previously we reset timeout but left peer demoted, causing deadlock!
-                                g_index_timeouts[(Sock)s] = 0;
-                                if (!g_peer_index_capable[(Sock)s]) {
-                                    g_peer_index_capable[(Sock)s] = true;
-                                    ps.syncing = true;
-                                    ps.next_index = chain_.height() + 1;
-                                }
-
-                                // Refill pipeline immediately
-                                fill_index_pipeline(ps);
-                            } else {
-                                // SAFETY NET: Even if inflight_index was 0, try to refill pipeline
-                                // This handles edge cases where tracking got out of sync
-                                // CRITICAL FIX: Also re-enable peer - they just delivered a block!
-                                g_index_timeouts[(Sock)s] = 0;
-                                if (!g_peer_index_capable[(Sock)s]) {
-                                    g_peer_index_capable[(Sock)s] = true;
-                                    ps.syncing = true;
-                                    ps.next_index = chain_.height() + 1;
-                                }
-                                fill_index_pipeline(ps);
                             }
+
+                            // NOTE: inflight_index decrement happens earlier unconditionally
+                            // when ps.syncing is true. No need to decrement again here.
+
+                            // CRITICAL FIX: Reset timeout counter AND re-enable the peer!
+                            // The peer just successfully delivered a block, proving it works.
+                            g_index_timeouts[(Sock)s] = 0;
+                            if (!g_peer_index_capable[(Sock)s]) {
+                                g_peer_index_capable[(Sock)s] = true;
+                                ps.syncing = true;
+                                ps.next_index = chain_.height() + 1;
+                            }
+
+                            // Refill pipeline immediately
+                            fill_index_pipeline(ps);
 
                             std::vector<std::vector<uint8_t>> want2;
                             chain_.next_block_fetch_targets(want2, /*cap=*/1);
