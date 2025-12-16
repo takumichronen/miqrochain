@@ -8960,6 +8960,16 @@ void P2P::loop(){
                             ps.total_blocks_received++;
                             ps.total_block_bytes_received += m.payload.size();
 
+                            // CRITICAL FIX: Recalculate health score on successful delivery
+                            // Previously only timeouts affected health (decay), but deliveries didn't restore it
+                            // This caused health to drop to 10% and stay there even as blocks arrived
+                            {
+                                double success_rate = (double)ps.blocks_delivered_successfully /
+                                    (ps.blocks_delivered_successfully + ps.blocks_failed_delivery + 1);
+                                double speed_factor = std::min(1.0, 30000.0 / std::max(1000.0, (double)ps.avg_block_delivery_ms));
+                                ps.health_score = 0.7 * success_rate + 0.3 * speed_factor;
+                            }
+
                             // INFLIGHT FIX: Peer delivered a block, ALWAYS decrement their inflight counter
                             // This is simpler and more reliable than trying to match specific indices
                             // The complex matching logic below can clean up tracking maps, but the counter
