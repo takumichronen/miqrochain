@@ -98,7 +98,7 @@
 // MIQ_OUTBOUND_TARGET already defined earlier in this file (line ~41) at 12
 
 #ifndef MIQ_INDEX_PIPELINE
-#define MIQ_INDEX_PIPELINE 128  // CRITICAL FIX: High pipeline for near-instant sync
+#define MIQ_INDEX_PIPELINE 512  // CRITICAL FIX: High pipeline for near-instant sync
 #endif
 
 // Outbound dialing cadence (ms) - faster for quicker network formation

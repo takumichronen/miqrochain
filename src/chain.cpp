@@ -724,27 +724,49 @@ bool Chain::get_header_hash_at_height(uint64_t target_height, std::vector<uint8_
 
     // If chains have diverged OR target is above our tip, use header chain
     if (best_header_diverged || target_height > tip_.height) {
-        if (!have_best_header) return false;
+        if (!have_best_header) {
+            return false;
+        }
 
         // If target height is beyond best header, fail
-        if (target_height > best_it->second.height) return false;
+        if (target_height > best_it->second.height) {
+            return false;
+        }
 
-        // Walk backwards from best header to find target height
+        // PERFORMANCE FIX: O(1) lookup using height-to-hash index
+        // This replaces the O(n) chain walk that was causing O(n²) sync performance
+        auto height_it = header_height_index_.find(target_height);
+        if (height_it != header_height_index_.end()) {
+            out = height_it->second;
+            return true;
+        }
+
+        // Fallback: Walk backwards from best header to find target height
+        // This path is only used if header_height_index_ wasn't populated (shouldn't happen)
+        log_warn("[HASH-LOOKUP] O(1) index miss for height " + std::to_string(target_height) + ", falling back to O(n) walk");
+
         std::vector<uint8_t> current_hash = best_it->second.hash;
         uint64_t current_height = best_it->second.height;
 
         while (current_height > target_height) {
             auto it = header_index_.find(hk(current_hash));
-            if (it == header_index_.end()) return false;
+            if (it == header_index_.end()) {
+                return false;
+            }
 
             current_hash = it->second.prev;
             current_height--;
+
+            // PERFORMANCE FIX: Populate the index as we walk (lazy fill)
+            // This ensures future lookups are O(1) even if initial population was missed
+            header_height_index_[current_height] = current_hash;
         }
 
         // Verify we found the right height
         auto final_it = header_index_.find(hk(current_hash));
-        if (final_it == header_index_.end()) return false;
-        if (final_it->second.height != target_height) return false;
+        if (final_it == header_index_.end() || final_it->second.height != target_height) {
+            return false;
+        }
 
         out = current_hash;
         return true;
@@ -887,6 +909,10 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
     header_index_.emplace(key, std::move(m));
     set_header_full(key, h);  // THREAD-SAFE
 
+    // PERFORMANCE FIX: Populate height-to-hash index for O(1) lookups
+    // This avoids O(n) chain walk in get_header_hash_at_height()
+    header_height_index_[saved_height] = hh;
+
     // BITCOIN CORE FIX: Register header with ReorgManager for chain selection
     // This enables proper reorg handling when competing chains have more work
     {
@@ -947,6 +973,9 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
                     header_index_.emplace(orphan_key, std::move(om));
                     set_header_full(orphan_key, orphan);
 
+                    // PERFORMANCE FIX: Populate height-to-hash index for O(1) lookups
+                    header_height_index_[orphan_saved_height] = orphan_hash;
+
                     // BITCOIN CORE FIX: Register orphan header with ReorgManager
                     {
                         miq::HeaderView ohv;
@@ -985,6 +1014,8 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
 
     if (best_header_key_.empty()) {
         best_header_key_ = key;
+        // DEBUG: Log when first header beyond genesis is accepted
+        log_info("accept_header: FIRST best_header set at height " + std::to_string(saved_height));
     } else {
         // STABILITY FIX: Use find() instead of at() to avoid exceptions
         auto cur_it = header_index_.find(best_header_key_);
@@ -1006,6 +1037,18 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
         bool equalish  = std::fabs(neu.work_sum - cur.work_sum) <= e;
 
         if (greater || (equalish && neu.height > cur.height)) {
+            // DEBUG: Log when best_header advances beyond tip
+            if (saved_height > tip_.height && saved_height > cur.height) {
+                static int64_t last_advance_log = 0;
+                int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                if (now - last_advance_log > 2000) {  // Log every 2 seconds max
+                    last_advance_log = now;
+                    log_info("accept_header: best_header ADVANCED from " +
+                            std::to_string(cur.height) + " to " + std::to_string(saved_height) +
+                            " (tip=" + std::to_string(tip_.height) + ")");
+                }
+            }
             best_header_key_ = key;
         }
     }
@@ -1885,6 +1928,8 @@ void Chain::rebuild_header_index_from_blocks(){
             m.work_sum = work_from_bits(blk.header.bits);
             header_index_.emplace(key, std::move(m));
             best_header_key_ = key;
+            // PERFORMANCE FIX: Populate height index for O(1) lookups
+            header_height_index_[0] = hh;
             // BITCOIN CORE FIX: Initialize ReorgManager with genesis during rebuild
             g_reorg.init_genesis(hh, blk.header.bits, blk.header.time);
             continue;
@@ -1923,6 +1968,9 @@ void Chain::rebuild_header_index_from_blocks(){
 
         header_index_.emplace(key, std::move(m));
         set_header_full(key, blk.header);  // THREAD-SAFE
+
+        // PERFORMANCE FIX: Populate height index for O(1) lookups
+        header_height_index_[rebuild_saved_height] = hh;
 
         // BITCOIN CORE FIX: Register rebuilt header with ReorgManager
         {

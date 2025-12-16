@@ -169,6 +169,11 @@ private:
     std::unordered_map<std::string, HeaderMeta> header_index_;
     std::string best_header_key_; // hk(hash) of best header by work_sum
 
+    // PERFORMANCE FIX: Height-to-hash index for O(1) lookups instead of O(n) chain walk
+    // Populated when headers are accepted, used by get_header_hash_at_height()
+    // Marked mutable because it's a cache that can be lazily populated from const methods
+    mutable std::unordered_map<uint64_t, std::vector<uint8_t>> header_height_index_;
+
     // Orphan raw blocks keyed by block-hash (hk)
     std::unordered_map<std::string, std::vector<uint8_t>> orphan_blocks_;
 
