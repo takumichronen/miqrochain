@@ -850,8 +850,23 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
         return false;
     }
 
+    // Save height before m is moved
+    uint64_t saved_height = m.height;
+
     header_index_.emplace(key, std::move(m));
     set_header_full(key, h);  // THREAD-SAFE
+
+    // BITCOIN CORE FIX: Register header with ReorgManager for chain selection
+    // This enables proper reorg handling when competing chains have more work
+    {
+        miq::HeaderView hv;
+        hv.hash   = hh;
+        hv.prev   = h.prev_hash;
+        hv.bits   = h.bits;
+        hv.time   = h.time;
+        hv.height = (uint32_t)saved_height;
+        g_reorg.on_validated_header(hv);
+    }
 
     // BITCOIN CORE FIX: Process any orphan headers waiting for this parent
     // Now that we've accepted this header, check if any orphans were waiting for it
@@ -894,9 +909,23 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
                         continue;  // Skip invalid orphan
                     }
 
+                    // Save height before om is moved
+                    uint64_t orphan_saved_height = om.height;
+
                     // Add to index
                     header_index_.emplace(orphan_key, std::move(om));
                     set_header_full(orphan_key, orphan);
+
+                    // BITCOIN CORE FIX: Register orphan header with ReorgManager
+                    {
+                        miq::HeaderView ohv;
+                        ohv.hash   = orphan_hash;
+                        ohv.prev   = orphan.prev_hash;
+                        ohv.bits   = orphan.bits;
+                        ohv.time   = orphan.time;
+                        ohv.height = (uint32_t)orphan_saved_height;
+                        g_reorg.on_validated_header(ohv);
+                    }
 
                     // Update best header if needed
                     auto cur_it = header_index_.find(best_header_key_);
@@ -1825,6 +1854,8 @@ void Chain::rebuild_header_index_from_blocks(){
             m.work_sum = work_from_bits(blk.header.bits);
             header_index_.emplace(key, std::move(m));
             best_header_key_ = key;
+            // BITCOIN CORE FIX: Initialize ReorgManager with genesis during rebuild
+            g_reorg.init_genesis(hh, blk.header.bits, blk.header.time);
             continue;
         }
 
@@ -1856,8 +1887,22 @@ void Chain::rebuild_header_index_from_blocks(){
             tip_.work_sum = m.work_sum;
         }
 
+        // Save height before m is moved
+        uint64_t rebuild_saved_height = m.height;
+
         header_index_.emplace(key, std::move(m));
         set_header_full(key, blk.header);  // THREAD-SAFE
+
+        // BITCOIN CORE FIX: Register rebuilt header with ReorgManager
+        {
+            miq::HeaderView rhv;
+            rhv.hash   = hh;
+            rhv.prev   = blk.header.prev_hash;
+            rhv.bits   = blk.header.bits;
+            rhv.time   = blk.header.time;
+            rhv.height = (uint32_t)rebuild_saved_height;
+            g_reorg.on_validated_header(rhv);
+        }
 
         // Update best header if this has more work
         if (best_header_key_.empty()) {
