@@ -3831,11 +3831,7 @@ void P2P::fill_index_pipeline(PeerState& ps){
     // BULLETPROOF SYNC: Fast parallel block downloads
     // Security is maintained through block hash validation in handle_incoming_block()
 
-    // IBD DIAGNOSTICS: Track early gate returns
-    static int64_t last_diag_ms = 0;
-    static uint64_t fill_calls = 0;
-    static uint64_t requests_sent = 0;
-    fill_calls++;
+    // IBD DIAGNOSTICS: (diagnostic variables removed - were unused)
 
     // Use adaptive pipeline size based on peer reputation
     uint32_t pipe;
@@ -4167,20 +4163,20 @@ bool P2P::request_block_index(PeerState& ps, uint64_t index){
             // Track as global request (by index for dedup)
             // RACE FIX: Check, insert, AND update g_inflight_index_ts all inside lock
             // to prevent cleanup thread from seeing inconsistent state
-            int64_t req_time = now_ms();
             {
+                const int64_t req_time = now_ms();
                 InflightLock lk(g_inflight_lock);
                 if (!force_mode && g_global_requested_indices.count(index)) {
                     // Check if we should allow speculative request (stale original)
                     auto ts_it = g_global_requested_indices_ts.find(index);
                     if (ts_it == g_global_requested_indices_ts.end() ||
-                        (now_ms() - ts_it->second) < SPECULATIVE_REQUEST_DELAY_MS) {
+                        (req_time - ts_it->second) < SPECULATIVE_REQUEST_DELAY_MS) {
                         return false;  // Already being requested and not stale
                     }
                     // Stale - allow speculative request (don't insert again, just update ts)
                 }
                 g_global_requested_indices.insert(index);
-                g_global_requested_indices_ts[index] = now_ms();  // STALL FIX: Track request time
+                g_global_requested_indices_ts[index] = req_time;  // STALL FIX: Track request time
             }
 
             // Use hash-based request
