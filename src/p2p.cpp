@@ -3278,7 +3278,7 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
     if (!sent) {
         log_warn("P2P: failed to send version to " + ip);
     } else {
-        P2P_TRACE("TX " + ip + " cmd=version len=" + std::to_string(payload.size()));
+        log_info("P2P: sent version to inbound peer " + ip);
     }
 }
 
@@ -7836,7 +7836,19 @@ void P2P::loop(){
                         if (itg2 == g_gate.end()) return;
                         auto& gg = itg2->second;
                         if (ps.verack_ok) return;
-                        if (!(gg.got_version && gg.got_verack && gg.sent_verack)) return;
+
+                        // COMPATIBILITY FIX: Some peers don't send verack properly
+                        // Accept handshake if we have version exchange (got_version + sent_verack)
+                        // The strict check (requiring got_verack) caused sync failures with some nodes
+                        bool version_exchange_complete = gg.got_version && gg.sent_verack;
+                        bool strict_handshake = gg.got_version && gg.got_verack && gg.sent_verack;
+
+                        if (!version_exchange_complete) return;
+
+                        // Log if using lenient handshake (missing verack from peer)
+                        if (version_exchange_complete && !strict_handshake) {
+                            log_warn("P2P: completing handshake without peer verack for " + ps.ip + " (compatibility mode)");
+                        }
 
                         // The handshake is complete at this point
 
