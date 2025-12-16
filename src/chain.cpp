@@ -840,37 +840,6 @@ bool Chain::accept_header(const BlockHeader& h, std::string& err) {
     // Headers can arrive out of order. Rejecting them means they're lost forever
     // and the node will never sync. Store them and process when parent arrives.
     if (!found_parent) {
-        // DEBUG: Log orphan header details to diagnose sync issues
-        static int64_t last_orphan_log_ms = 0;
-        static size_t orphan_count_since_log = 0;
-        static std::vector<uint8_t> first_orphan_prev;
-        orphan_count_since_log++;
-        if (first_orphan_prev.empty()) first_orphan_prev = h.prev_hash;
-        int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-        if (now - last_orphan_log_ms > 5000) {  // Log at most every 5 seconds
-            last_orphan_log_ms = now;
-            // Show first orphan's prev_hash for debugging
-            std::string prev_hex;
-            for (size_t i = 0; i < std::min(first_orphan_prev.size(), (size_t)8); ++i) {
-                char buf[3]; snprintf(buf, 3, "%02x", first_orphan_prev[i]);
-                prev_hex += buf;
-            }
-            // Show tip_hash for comparison
-            std::string tip_hex;
-            for (size_t i = 0; i < std::min(tip_.hash.size(), (size_t)8); ++i) {
-                char buf[3]; snprintf(buf, 3, "%02x", tip_.hash[i]);
-                tip_hex += buf;
-            }
-            log_warn("accept_header: ORPHAN - prev_hash not found. "
-                "count=" + std::to_string(orphan_count_since_log) +
-                " idx_size=" + std::to_string(header_index_.size()) +
-                " tip_h=" + std::to_string(tip_.height) +
-                " best_h=" + std::to_string(best_header_height()) +
-                " prev=" + prev_hex + "... tip=" + tip_hex + "...");
-            orphan_count_since_log = 0;
-            first_orphan_prev.clear();
-        }
         std::string parent_key = hk(h.prev_hash);
 
         // Check memory limit
