@@ -1488,6 +1488,21 @@ static int64_t g_stall_retry_ms = MIQ_P2P_STALL_RETRY_MS;
 // which wastes bandwidth and can create duplicate orphans causing sync issues.
 static std::unordered_set<uint64_t> g_global_requested_indices;
 
+// ============================================================================
+// SYNC DIAGNOSTICS: Track exactly what's happening during block sync
+// ============================================================================
+static std::atomic<uint64_t> g_diag_blocks_requested{0};    // Total blocks requested
+static std::atomic<uint64_t> g_diag_blocks_received{0};     // Total blocks received
+static std::atomic<uint64_t> g_diag_blocks_processed{0};    // Total blocks processed
+static std::atomic<int64_t>  g_diag_last_log_ms{0};         // Last diagnostic log time
+static std::atomic<uint64_t> g_diag_last_height{0};         // Height at last log
+static std::atomic<uint64_t> g_diag_fill_blocked_not_capable{0};
+static std::atomic<uint64_t> g_diag_fill_blocked_fork{0};
+static std::atomic<uint64_t> g_diag_fill_blocked_pending_verify{0};
+static std::atomic<uint64_t> g_diag_fill_blocked_max_index{0};
+static std::atomic<uint64_t> g_diag_fill_blocked_already_requested{0};
+static std::atomic<uint64_t> g_diag_fill_blocked_pipe_full{0};
+
 // CRITICAL FIX: Track inflight tx request timestamps for timeout cleanup
 // Without this, inflight_tx can grow forever, eventually blocking all new tx requests
 static std::unordered_map<Sock, std::unordered_map<std::string,int64_t>> g_inflight_tx_ts;
@@ -3718,14 +3733,7 @@ void P2P::fill_index_pipeline(PeerState& ps){
 
     // peer_is_index_capable is set by start_sync_with_peer
     if (!peer_is_index_capable((Sock)ps.sock)) {
-        // IBD DIAG: Log why we're returning early
-        int64_t now_diag = now_ms();
-        if (now_diag - last_diag_ms > 2000) {
-            last_diag_ms = now_diag;
-            log_info("[IBD-DIAG] fill_index_pipeline BLOCKED: peer " + ps.ip +
-                    " not index_capable (fill_calls=" + std::to_string(fill_calls) +
-                    " requests_sent=" + std::to_string(requests_sent) + ")");
-        }
+        g_diag_fill_blocked_not_capable++;
         return;
     }
 
@@ -3737,9 +3745,7 @@ void P2P::fill_index_pipeline(PeerState& ps){
         uint64_t our_height = chain_.height();
         uint64_t peer_height = ps.peer_tip_height;
         if (peer_height <= our_height) {
-            P2P_TRACE("Skipping fill_index_pipeline for forked peer " + ps.ip +
-                      " (their height " + std::to_string(peer_height) +
-                      " <= our height " + std::to_string(our_height) + ")");
+            g_diag_fill_blocked_fork++;
             return;
         }
         // Peer has longer chain - continue syncing for potential reorg
@@ -3751,7 +3757,7 @@ void P2P::fill_index_pipeline(PeerState& ps){
     // CRITICAL: Don't sync from peers pending fork verification!
     // We must verify they're on the same chain before downloading blocks
     if (ps.fork_verification_pending) {
-        P2P_TRACE("Skipping fill_index_pipeline - fork verification pending for " + ps.ip);
+        g_diag_fill_blocked_pending_verify++;
         return;
     }
 
@@ -3810,19 +3816,7 @@ void P2P::fill_index_pipeline(PeerState& ps){
 
         // Backpressure: Stop if we're too far ahead of the tip or beyond header height
         if (idx > max_index) {
-            // Don't request more - wait for chain/headers to catch up
-            // IBD DIAG: Log if we're blocked by max_index early
-            if (loop_requests == 0 && !g_logged_headers_done) {
-                int64_t now_diag = now_ms();
-                if (now_diag - last_diag_ms > 2000) {
-                    last_diag_ms = now_diag;
-                    log_info("[IBD-DIAG] fill STOPPED at idx " + std::to_string(idx) +
-                            " > max_index " + std::to_string(max_index) +
-                            " (peer_limit=" + std::to_string(peer_limit) +
-                            " hdr=" + std::to_string(chain_.best_header_height()) +
-                            " tip=" + std::to_string(chain_.height()) + ")");
-                }
-            }
+            if (loop_requests == 0) g_diag_fill_blocked_max_index++;
             break;
         }
 
@@ -3833,30 +3827,13 @@ void P2P::fill_index_pipeline(PeerState& ps){
             InflightLock lk(g_inflight_lock);
             const bool force_mode = g_force_completion_mode.load(std::memory_order_relaxed);
 
-            // DIAG: Track consecutive skips to detect stuck indices
-            static uint64_t consecutive_skips = 0;
-            static int64_t last_skip_log_ms = 0;
-
             if (!force_mode && g_global_requested_indices.count(idx)) {
-                consecutive_skips++;
-
-                // Log if we're skipping many consecutive indices
-                int64_t now_skip = now_ms();
-                if (consecutive_skips >= 50 && (now_skip - last_skip_log_ms > 5000)) {
-                    last_skip_log_ms = now_skip;
-                    log_warn("[SYNC-DIAG] Skipped " + std::to_string(consecutive_skips) +
-                            " consecutive indices in global_requested! idx=" + std::to_string(idx) +
-                            " global_size=" + std::to_string(g_global_requested_indices.size()) +
-                            " chain=" + std::to_string(chain_.height()));
-                    consecutive_skips = 0;
-                }
+                g_diag_fill_blocked_already_requested++;
 
                 // Another peer is already fetching this index, skip to next
                 ps.next_index++;
                 continue;
             }
-            // Reset when we actually make a request
-            consecutive_skips = 0;
         }
 
         // Check if we should skip this index (already have it or exceeds limits)
@@ -3883,43 +3860,17 @@ void P2P::fill_index_pipeline(PeerState& ps){
         if (request_block_index(ps, idx)) {
             ps.next_index++;
             ps.inflight_index++;
-            requests_sent++;  // IBD DIAG: Track total requests
-            loop_requests++;  // IBD DIAG: Track this fill's requests
-
-            // IBD DIAGNOSTICS: Log progress periodically
-            #if MIQ_TIMING_INSTRUMENTATION
-            static std::atomic<int64_t> last_ibd_diag_ms{0};
-            int64_t diag_now = now_ms();
-            if (!g_logged_headers_done && diag_now - last_ibd_diag_ms.load(std::memory_order_relaxed) > 5000) {
-                last_ibd_diag_ms.store(diag_now, std::memory_order_relaxed);
-                size_t total_inflight = 0;
-                for (auto& kvp : peers_) {
-                    total_inflight += kvp.second.inflight_index;
-                }
-                log_info("[IBD] Diagnostics: total_inflight=" + std::to_string(total_inflight) +
-                        " this_peer=" + ps.ip + " peer_inflight=" + std::to_string(ps.inflight_index) +
-                        " pipe=" + std::to_string(pipe) + " chain_height=" + std::to_string(current_height));
-            }
-            #endif
+            g_diag_blocks_requested++;
+            loop_requests++;
         } else {
             // Send failed - stop requesting from this peer (socket issue)
             break;
         }
     }
 
-    // IBD DIAG: Periodic summary of fill status (every 5 seconds during early IBD)
-    if (!g_logged_headers_done && chain_.height() < 100) {
-        int64_t now_diag = now_ms();
-        if (now_diag - last_diag_ms > 5000) {
-            last_diag_ms = now_diag;
-            log_info("[IBD-DIAG] fill summary: peer=" + ps.ip +
-                    " sent=" + std::to_string(loop_requests) +
-                    " inflight=" + std::to_string(ps.inflight_index) +
-                    " pipe=" + std::to_string(pipe) +
-                    " next_idx=" + std::to_string(ps.next_index) +
-                    " height=" + std::to_string(chain_.height()) +
-                    " hdr=" + std::to_string(chain_.best_header_height()));
-        }
+    // Track if we exited because pipe was full (couldn't request anything)
+    if (loop_requests == 0 && ps.inflight_index >= pipe) {
+        g_diag_fill_blocked_pipe_full++;
     }
 }
 
@@ -4363,6 +4314,8 @@ void P2P::queue_block_by_height(uint64_t height, const std::vector<uint8_t>& has
     // Don't queue if we already have it
     if (pending_blocks_.count(height)) return;
 
+    g_diag_blocks_received++;
+
     PendingBlock pb;
     pb.hash = hash;
     pb.raw = raw;
@@ -4438,6 +4391,79 @@ void P2P::process_pending_blocks() {
     uint64_t next_height = current_height + 1;
     int blocks_processed = 0;
     static int64_t last_pending_log_ms = 0;
+
+    // ========================================================================
+    // SYNC DIAGNOSTICS: Log complete sync state every 3 seconds
+    // ========================================================================
+    int64_t diag_now = now_ms();
+    if (diag_now - g_diag_last_log_ms.load() > 3000) {
+        uint64_t prev_height = g_diag_last_height.load();
+        int64_t prev_time = g_diag_last_log_ms.load();
+        g_diag_last_log_ms.store(diag_now);
+        g_diag_last_height.store(current_height);
+
+        // Calculate blocks/sec
+        double elapsed_sec = (prev_time > 0) ? (diag_now - prev_time) / 1000.0 : 1.0;
+        double blocks_per_sec = (prev_height > 0 && elapsed_sec > 0)
+            ? (current_height - prev_height) / elapsed_sec : 0;
+
+        // Count total inflight across all peers
+        size_t total_inflight = 0;
+        size_t syncing_peers = 0;
+        size_t capable_peers = 0;
+        size_t pending_verify = 0;
+        {
+            std::lock_guard<std::recursive_mutex> lk(g_peers_mu);
+            for (auto& kvp : peers_) {
+                total_inflight += kvp.second.inflight_index;
+                if (kvp.second.syncing) syncing_peers++;
+                if (peer_is_index_capable(kvp.first)) capable_peers++;
+                if (kvp.second.fork_verification_pending) pending_verify++;
+            }
+        }
+
+        // Get global requested size
+        size_t global_requested = 0;
+        {
+            InflightLock lk(g_inflight_lock);
+            global_requested = g_global_requested_indices.size();
+        }
+
+        log_info("[SYNC-DIAG] height=" + std::to_string(current_height) +
+                " hdr=" + std::to_string(chain_.best_header_height()) +
+                " target=" + std::to_string(g_max_known_peer_tip.load()) +
+                " rate=" + std::to_string((int)blocks_per_sec) + "/s" +
+                " pending=" + std::to_string(pending_blocks_.size()) +
+                " inflight=" + std::to_string(total_inflight) +
+                " global_req=" + std::to_string(global_requested) +
+                " peers=" + std::to_string(capable_peers) + "/" + std::to_string(syncing_peers) +
+                " verify=" + std::to_string(pending_verify));
+
+        // Log blocking reasons if any are high
+        uint64_t blk_not_cap = g_diag_fill_blocked_not_capable.exchange(0);
+        uint64_t blk_fork = g_diag_fill_blocked_fork.exchange(0);
+        uint64_t blk_verify = g_diag_fill_blocked_pending_verify.exchange(0);
+        uint64_t blk_max_idx = g_diag_fill_blocked_max_index.exchange(0);
+        uint64_t blk_already = g_diag_fill_blocked_already_requested.exchange(0);
+        uint64_t blk_pipe = g_diag_fill_blocked_pipe_full.exchange(0);
+
+        if (blk_not_cap + blk_fork + blk_verify + blk_max_idx + blk_already + blk_pipe > 0) {
+            log_info("[SYNC-DIAG] blocked: not_capable=" + std::to_string(blk_not_cap) +
+                    " fork=" + std::to_string(blk_fork) +
+                    " pending_verify=" + std::to_string(blk_verify) +
+                    " max_index=" + std::to_string(blk_max_idx) +
+                    " already_req=" + std::to_string(blk_already) +
+                    " pipe_full=" + std::to_string(blk_pipe));
+        }
+
+        // Log request/receive stats
+        uint64_t req = g_diag_blocks_requested.load();
+        uint64_t recv = g_diag_blocks_received.load();
+        uint64_t proc = g_diag_blocks_processed.load();
+        log_info("[SYNC-DIAG] totals: requested=" + std::to_string(req) +
+                " received=" + std::to_string(recv) +
+                " processed=" + std::to_string(proc));
+    }
 
     // Process blocks in strict height order
     while (true) {
@@ -4526,6 +4552,7 @@ void P2P::process_pending_blocks() {
 
         if (accepted) {
             blocks_processed++;
+            g_diag_blocks_processed++;
 
             // TIMING: Record block receive time for recv→relay latency calculation
             #if MIQ_TIMING_INSTRUMENTATION
