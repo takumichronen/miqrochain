@@ -5345,14 +5345,35 @@ void P2P::loop(){
                     std::string health_summary;
                     for (const auto& kv : peers_) {
                         if (!kv.second.verack_ok) continue;
+                        // CRITICAL FIX: Show inflight_index during IBD (that's what matters), not inflight_blocks
                         health_summary += "\n  " + kv.second.ip +
                                         ": health=" + std::to_string((int)(kv.second.health_score * 100)) + "%" +
                                         " avg_delivery=" + std::to_string(kv.second.avg_block_delivery_ms / 1000) + "s" +
-                                        " blocks=" + std::to_string(kv.second.total_blocks_received) +
-                                        " inflight=" + std::to_string(kv.second.inflight_blocks.size());
+                                        " blocks=" + std::to_string(kv.second.blocks_delivered_successfully) +
+                                        " inflight=" + std::to_string(kv.second.inflight_index);
                     }
                     if (!health_summary.empty()) {
                         log_info("P2P: peer health summary:" + health_summary);
+                    }
+
+                    // CRITICAL FIX: Proactively decay health for peers with high inflight but not delivering
+                    // This catches peers that are holding onto requests but not responding.
+                    // BUG: Previously, only timeouts decayed health, but a peer could have many
+                    // inflight requests that haven't timed out yet, maintaining artificially high health
+                    // while blocking sync progress.
+                    for (auto& kv : peers_) {
+                        auto& ps = kv.second;
+                        if (!ps.verack_ok) continue;
+                        // If peer has 64+ inflight_index requests but hasn't delivered anything recently,
+                        // decay their health. This prevents "phantom healthy" peers from hogging requests.
+                        // The stall itself indicates the peer isn't delivering.
+                        if (ps.inflight_index >= 64 && stall_duration_ms > 5000) {
+                            // Decay health proportionally to how much they're hogging
+                            // More inflight = more aggressive decay
+                            double decay = 0.95 - (0.1 * (ps.inflight_index / 256.0)); // 0.85-0.95
+                            decay = std::max(0.8, std::min(0.95, decay));
+                            ps.health_score = std::max(0.1, ps.health_score * decay);
+                        }
                     }
 
                     // DISCONNECT NON-RESPONSIVE PEERS
@@ -5362,14 +5383,17 @@ void P2P::loop(){
                     for (const auto& kv : peers_) {
                         const auto& ps = kv.second;
                         if (!ps.verack_ok) continue;
+                        // CRITICAL FIX: Include inflight_index in non-responsive check
                         // Peer has health < 20%, never delivered a block, but has 64+ inflight
+                        size_t total_inflight = ps.inflight_blocks.size() + ps.inflight_index;
                         bool is_non_responsive = (ps.health_score < 0.20) &&
-                                                 (ps.total_blocks_received == 0) &&
-                                                 (ps.inflight_blocks.size() >= 64);
+                                                 (ps.blocks_delivered_successfully == 0) &&
+                                                 (total_inflight >= 64);
                         if (is_non_responsive) {
                             log_warn("P2P: disconnecting non-responsive peer " + ps.ip +
                                     " (health=" + std::to_string((int)(ps.health_score * 100)) + "%" +
-                                    " blocks=0 inflight=" + std::to_string(ps.inflight_blocks.size()) + ")");
+                                    " blocks=" + std::to_string(ps.blocks_delivered_successfully) +
+                                    " inflight=" + std::to_string(total_inflight) + ")");
                             dead_peer_ips.push_back(ps.ip);
                         }
                     }
@@ -5756,6 +5780,12 @@ void P2P::loop(){
                     g_global_requested_indices.erase(idx);
                 }
                 if (ps.inflight_index > 0) ps.inflight_index--; // free a slot on original peer
+                // CRITICAL FIX: Decay health on index-based timeout (same as hash-based)
+                // BUG: Previously only hash-based timeouts decayed health (line 5657)
+                // Index-based timeouts didn't decay health, causing peers that don't respond
+                // to index requests to keep high health while actively-delivering peers got punished
+                ps.blocks_failed_delivery++;
+                ps.health_score = std::max(0.1, ps.health_score * 0.9);
               } else {
                 break; // front is still within timeout window
               }
