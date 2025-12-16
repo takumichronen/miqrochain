@@ -4805,8 +4805,20 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
     int64_t parent_height = chain_.get_header_height(b.header.prev_hash);
     uint64_t block_height = 0;
 
+    // DIAG: Log parent lookup for early blocks
+    if (parent_height < 0 && chain_.height() < 10) {
+        log_warn("[BLOCK-DIAG] Block with unknown parent! prev=" + hexkey(b.header.prev_hash).substr(0,16) +
+                "... (parent_height=-1, our_height=" + std::to_string(chain_.height()) + ")");
+    }
+
     if (parent_height >= 0) {
         block_height = static_cast<uint64_t>(parent_height) + 1;
+
+        // DIAG: Log block 2 specifically
+        if (block_height == 2) {
+            log_info("[BLOCK-DIAG] Received block 2! hash=" + hexkey(bh).substr(0,16) +
+                    "... parent=" + hexkey(b.header.prev_hash).substr(0,16) + "...");
+        }
 
         // Validate block hash against header index (if we have headers)
         std::vector<uint8_t> expected_hash;
@@ -6447,6 +6459,15 @@ void P2P::loop(){
                           // Try to get the block hash from our header chain
                           std::vector<uint8_t> block_hash;
                           bool have_hash = chain_.get_header_hash_at_height(next_needed, block_hash);
+
+                          // DIAG: Log what hash we're requesting for missing blocks
+                          if (gap_request_count == 1 && have_hash) {
+                              log_info("[GAP-DIAG] Missing block " + std::to_string(next_needed) +
+                                      " hash=" + hexkey(block_hash).substr(0,16) + "...");
+                          } else if (gap_request_count == 1 && !have_hash) {
+                              log_warn("[GAP-DIAG] Missing block " + std::to_string(next_needed) +
+                                      " - NO HASH AVAILABLE from header chain!");
+                          }
 
                           // Find best peer
                           Sock target = MIQ_INVALID_SOCK;
