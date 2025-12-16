@@ -3975,12 +3975,17 @@ bool P2P::request_block_index(PeerState& ps, uint64_t index){
             const bool force_mode = g_force_completion_mode.load(std::memory_order_relaxed);
 
             // Track as global request (by index for dedup)
+            // RACE FIX: Check, insert, AND update g_inflight_index_ts all inside lock
+            // to prevent cleanup thread from seeing inconsistent state
+            int64_t req_time = now_ms();
             {
                 InflightLock lk(g_inflight_lock);
                 if (!force_mode && g_global_requested_indices.count(index)) {
                     return false;  // Already being requested
                 }
                 g_global_requested_indices.insert(index);
+                g_inflight_index_ts[(Sock)ps.sock][index] = req_time;
+                g_inflight_index_order[(Sock)ps.sock].push_back(index);
             }
 
             // Use hash-based request
@@ -3988,8 +3993,6 @@ bool P2P::request_block_index(PeerState& ps, uint64_t index){
             if (send_or_close(ps.sock, msg)) {
                 ps.inflight_blocks.insert(key);
                 g_global_inflight_blocks.insert(key);
-                g_inflight_index_ts[(Sock)ps.sock][index] = now_ms();
-                g_inflight_index_order[(Sock)ps.sock].push_back(index);
                 P2P_TRACE("TX " + ps.ip + " getb (hash-based) for index " + std::to_string(index));
                 return true;
             }
@@ -3997,6 +4000,9 @@ bool P2P::request_block_index(PeerState& ps, uint64_t index){
             {
                 InflightLock lk(g_inflight_lock);
                 g_global_requested_indices.erase(index);
+                g_inflight_index_ts[(Sock)ps.sock].erase(index);
+                auto& order = g_inflight_index_order[(Sock)ps.sock];
+                order.erase(std::remove(order.begin(), order.end(), index), order.end());
             }
             return false;
         }
@@ -5942,12 +5948,12 @@ void P2P::loop(){
             uint8_t p8[8]; for (int i=0;i<8;i++) p8[i] = (uint8_t)((e.idx>>(8*i))&0xFF);
             auto msg = encode_msg("getbi", std::vector<uint8_t>(p8,p8+8));
             if (send_or_close(target, msg)){
-              g_inflight_index_ts[target][e.idx] = now_ms();
-              g_inflight_index_order[target].push_back(e.idx);
-              // Re-add to global tracking for the new peer
+              // RACE FIX: Update all tracking INSIDE lock atomically
               {
                   InflightLock lk(g_inflight_lock);
                   g_global_requested_indices.insert(e.idx);
+                  g_inflight_index_ts[target][e.idx] = now_ms();
+                  g_inflight_index_order[target].push_back(e.idx);
               }
               itT->second.inflight_index++;
             } else {
@@ -6617,11 +6623,12 @@ void P2P::loop(){
                                   for (int i = 0; i < 8; i++) p8[i] = (uint8_t)((idx >> (8 * i)) & 0xFF);
                                   auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
                                   if (send_or_close(target, msg)) {
-                                      g_inflight_index_ts[target][idx] = tnow;
-                                      g_inflight_index_order[target].push_back(idx);
+                                      // RACE FIX: Update all tracking INSIDE lock atomically
                                       {
                                           InflightLock lk(g_inflight_lock);
                                           g_global_requested_indices.insert(idx);
+                                          g_inflight_index_ts[target][idx] = tnow;
+                                          g_inflight_index_order[target].push_back(idx);
                                       }
                                       itT->second.inflight_index++;
                                   }
@@ -6680,19 +6687,26 @@ void P2P::loop(){
 
                           gap_request_count++;
 
-                          // Clear from global tracking to allow fresh request
-                          {
-                              InflightLock lk(g_inflight_lock);
-                              g_global_requested_indices.erase(next_needed);
-                          }
+                          // CRITICAL FIX: Only clear from tracking for attempts 1-5
+                          // After attempt 5, we wait 30 seconds before trying again.
+                          // If we erase but don't re-add (because we're waiting), the index
+                          // becomes "lost" - not in tracking, so fill_index_pipeline won't
+                          // request it either. This caused sync stalls at height 1412!
+                          if (gap_request_count <= 5) {
+                              // Clear from global tracking to allow fresh request
+                              {
+                                  InflightLock lk(g_inflight_lock);
+                                  g_global_requested_indices.erase(next_needed);
+                              }
 
-                          // Also clear from all peer tracking
-                          for (auto& kv : g_inflight_index_ts) {
-                              kv.second.erase(next_needed);
-                          }
-                          for (auto& kv : g_inflight_index_order) {
-                              auto& dq = kv.second;
-                              dq.erase(std::remove(dq.begin(), dq.end(), next_needed), dq.end());
+                              // Also clear from all peer tracking
+                              for (auto& kv : g_inflight_index_ts) {
+                                  kv.second.erase(next_needed);
+                              }
+                              for (auto& kv : g_inflight_index_order) {
+                                  auto& dq = kv.second;
+                                  dq.erase(std::remove(dq.begin(), dq.end(), next_needed), dq.end());
+                              }
                           }
 
                           // ============================================================
@@ -6762,12 +6776,14 @@ void P2P::loop(){
                                               g_global_inflight_blocks.insert(key);
                                               // CRITICAL FIX: Re-add to index tracking!
                                               // Otherwise fill_index_pipeline can't see this is being requested
+                                              // RACE FIX: Update g_inflight_index_ts INSIDE lock to prevent
+                                              // cleanup thread from removing index due to inconsistent state
                                               {
                                                   InflightLock lk(g_inflight_lock);
                                                   g_global_requested_indices.insert(next_needed);
+                                                  g_inflight_index_ts[target][next_needed] = tnow;
+                                                  g_inflight_index_order[target].push_back(next_needed);
                                               }
-                                              g_inflight_index_ts[target][next_needed] = tnow;
-                                              g_inflight_index_order[target].push_back(next_needed);
                                               sent = true;
                                           }
                                       }
@@ -6781,12 +6797,13 @@ void P2P::loop(){
                                           for (int i = 0; i < 8; i++) p8[i] = (uint8_t)((next_needed >> (8 * i)) & 0xFF);
                                           auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
                                           if (send_or_close(target, msg)) {
+                                              // RACE FIX: Update all tracking INSIDE lock
                                               {
                                                   InflightLock lk(g_inflight_lock);
                                                   g_global_requested_indices.insert(next_needed);
+                                                  g_inflight_index_ts[target][next_needed] = tnow;
+                                                  g_inflight_index_order[target].push_back(next_needed);
                                               }
-                                              g_inflight_index_ts[target][next_needed] = tnow;
-                                              g_inflight_index_order[target].push_back(next_needed);
                                               itT->second.inflight_index++;
                                               sent = true;
                                               log_info("[GAP] Requested block " + std::to_string(next_needed) +
@@ -6822,12 +6839,13 @@ void P2P::loop(){
                                           if (send_or_close(kvp.first, msg)) {
                                               kvp.second.inflight_blocks.insert(key);
                                               g_global_inflight_blocks.insert(key);
+                                              // RACE FIX: Update all tracking INSIDE lock
                                               {
                                                   InflightLock lk(g_inflight_lock);
                                                   g_global_requested_indices.insert(next_needed);
+                                                  g_inflight_index_ts[kvp.first][next_needed] = tnow;
+                                                  g_inflight_index_order[kvp.first].push_back(next_needed);
                                               }
-                                              g_inflight_index_ts[kvp.first][next_needed] = tnow;
-                                              g_inflight_index_order[kvp.first].push_back(next_needed);
                                           }
                                       } else {
                                           // Fallback to getbi when hash unavailable
@@ -6835,12 +6853,13 @@ void P2P::loop(){
                                           for (int i = 0; i < 8; i++) p8[i] = (uint8_t)((next_needed >> (8 * i)) & 0xFF);
                                           auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
                                           if (send_or_close(kvp.first, msg)) {
+                                              // RACE FIX: Update all tracking INSIDE lock
                                               {
                                                   InflightLock lk(g_inflight_lock);
                                                   g_global_requested_indices.insert(next_needed);
+                                                  g_inflight_index_ts[kvp.first][next_needed] = tnow;
+                                                  g_inflight_index_order[kvp.first].push_back(next_needed);
                                               }
-                                              g_inflight_index_ts[kvp.first][next_needed] = tnow;
-                                              g_inflight_index_order[kvp.first].push_back(next_needed);
                                               kvp.second.inflight_index++;
                                           }
                                       }
@@ -6895,7 +6914,13 @@ void P2P::loop(){
                                            (have_hash ? " [hash-based]" : " [index-based]"));
                               }
                               // After broadcast, wait 30 more seconds before trying again
-                              // gap_request_count will keep incrementing but we won't spam
+                              // At 100ms interval, 300 attempts = 30 seconds
+                              // Reset counter at 305 to restart the request cycle
+                              if (gap_request_count >= 305) {
+                                  log_info("P2P: Gap at index " + std::to_string(next_needed) +
+                                           " - retrying after 30s timeout");
+                                  gap_request_count = 0;  // Will become 1 on next iteration
+                              }
                           }
                       }
                   }
@@ -7939,12 +7964,12 @@ void P2P::loop(){
                             uint8_t p8[8]; for (int j=0;j<8;j++) p8[j] = (uint8_t)((idx>>(8*j))&0xFF);
                             auto msg = encode_msg("getbi", std::vector<uint8_t>(p8,p8+8));
                             if (send_or_close(target, msg)) {
-                                g_inflight_index_ts[target][idx] = now_ms();
-                                g_inflight_index_order[target].push_back(idx);
-                                // BUG FIX: Re-add to global tracking to prevent duplicate requests
+                                // RACE FIX: Update all tracking INSIDE lock atomically
                                 {
                                     InflightLock lk(g_inflight_lock);
                                     g_global_requested_indices.insert(idx);
+                                    g_inflight_index_ts[target][idx] = now_ms();
+                                    g_inflight_index_order[target].push_back(idx);
                                 }
                                 itT->second.inflight_index++;
                             }
@@ -10381,11 +10406,12 @@ void P2P::loop(){
                                 for (int j = 0; j < 8; j++) p8[j] = (uint8_t)((idx >> (8 * j)) & 0xFF);
                                 auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
                                 if (send_or_close(target, msg)) {
-                                    g_inflight_index_ts[target][idx] = now_ms();
-                                    g_inflight_index_order[target].push_back(idx);
+                                    // RACE FIX: Update all tracking INSIDE lock atomically
                                     {
                                         InflightLock lk(g_inflight_lock);
                                         g_global_requested_indices.insert(idx);
+                                        g_inflight_index_ts[target][idx] = now_ms();
+                                        g_inflight_index_order[target].push_back(idx);
                                     }
                                     itT->second.inflight_index++;
                                 }
