@@ -3729,11 +3729,23 @@ void P2P::fill_index_pipeline(PeerState& ps){
         return;
     }
 
-    // CRITICAL: Don't sync from peers on a different fork!
-    // This prevents wasting bandwidth and getting confused by fork blocks
+    // FORK HANDLING: If peer has a different chain, check if theirs is LONGER
+    // If they have more blocks, we should sync from them to enable reorg
+    // Only skip if they have fewer/equal blocks (truly on inferior fork)
     if (ps.fork_detected) {
-        P2P_TRACE("Skipping fill_index_pipeline for forked peer " + ps.ip);
-        return;
+        // Check if peer has longer chain (more work)
+        uint64_t our_height = chain_.height();
+        uint64_t peer_height = ps.peer_tip_height;
+        if (peer_height <= our_height) {
+            P2P_TRACE("Skipping fill_index_pipeline for forked peer " + ps.ip +
+                      " (their height " + std::to_string(peer_height) +
+                      " <= our height " + std::to_string(our_height) + ")");
+            return;
+        }
+        // Peer has longer chain - continue syncing for potential reorg
+        P2P_TRACE("Forked peer " + ps.ip + " has longer chain (" +
+                  std::to_string(peer_height) + " > " + std::to_string(our_height) +
+                  ") - continuing sync for reorg");
     }
 
     // CRITICAL: Don't sync from peers pending fork verification!
@@ -8763,6 +8775,14 @@ void P2P::loop(){
                             // If peer sends a block with prev_hash that doesn't match our
                             // chain at that height, they're on a different fork.
                             // ================================================================
+                            // CRITICAL FIX: Do NOT reject blocks from "forked" peers!
+                            // The peer might have a LONGER chain with more work.
+                            // Let the reorg system evaluate it - handle_incoming_block will
+                            // submit competing blocks to accept_block_for_reorg() which
+                            // determines if we should switch chains.
+                            // The old code rejected fork blocks with "continue", preventing
+                            // reorgs to longer chains entirely.
+                            // ================================================================
                             {
                                 // Get expected height for this block from its prev_hash
                                 int64_t parent_height = chain_.get_header_height(hb.header.prev_hash);
@@ -8775,19 +8795,20 @@ void P2P::loop(){
                                         auto received_hash = hb.block_hash();
                                         auto our_hash = our_block.block_hash();
                                         if (our_hash != received_hash) {
-                                            // FORK DETECTED: Peer sent a different block for same height
+                                            // Different block at same height - potential fork
+                                            // Log once but DON'T skip - let reorg system evaluate
                                             if (!ps.fork_detected) {
-                                                log_warn("P2P: FORK DETECTED - peer " + ps.ip +
-                                                        " sent different block at height " + std::to_string(expected_height) +
-                                                        " (they are on a different chain)");
+                                                log_info("P2P: Peer " + ps.ip +
+                                                        " has different block at height " + std::to_string(expected_height) +
+                                                        " - evaluating for potential reorg");
                                                 ps.fork_detected = true;
                                                 ps.fork_check_height = expected_height;
                                                 ps.fork_check_hash = received_hash;
-                                                // Stop syncing from this forked peer
-                                                ps.syncing = false;
-                                                g_peer_index_capable[(Sock)s] = false;
+                                                // DON'T disable sync - peer might have longer chain!
+                                                // The reorg manager will determine if their chain has more work
                                             }
-                                            continue;  // Don't process blocks from forked peers
+                                            // CRITICAL FIX: Fall through to handle_incoming_block!
+                                            // Don't skip - let the reorg evaluation happen.
                                         }
                                     }
                                 } else if (!ps.fork_verified && parent_height >= 0 && chain_.height() > 0) {
