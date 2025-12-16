@@ -5340,6 +5340,25 @@ void P2P::loop(){
                 int64_t stall_duration_ms = tnow - g_last_progress_ms;
                 log_info("P2P: stall detected - no height progress for " + std::to_string(stall_duration_ms / 1000) + "s (height=" + std::to_string(h) + ", peers=" + std::to_string(peers_.size()) + ")");
 
+                // STALL DIAGNOSTIC: Log global tracking state to identify stuck indices
+                {
+                    InflightLock lk(g_inflight_lock);
+                    size_t global_count = g_global_requested_indices.size();
+                    uint64_t oldest_idx = 0;
+                    uint64_t stale_count = 0;
+                    for (uint64_t idx : g_global_requested_indices) {
+                        if (oldest_idx == 0 || idx < oldest_idx) oldest_idx = idx;
+                        if (idx <= h) stale_count++;
+                    }
+                    if (global_count > 0) {
+                        log_info("P2P: STALL DIAGNOSTIC: global_indices=" + std::to_string(global_count) +
+                                " oldest_idx=" + std::to_string(oldest_idx) +
+                                " stale_count=" + std::to_string(stale_count) +
+                                " next_needed=" + std::to_string(h + 1) +
+                                " header_height=" + std::to_string(chain_.best_header_height()));
+                    }
+                }
+
                 // Log peer health during stalls (helps diagnose slow peers)
                 if (!g_logged_headers_done) {
                     std::string health_summary;
@@ -6012,22 +6031,18 @@ void P2P::loop(){
                            "s at height " + std::to_string(chain_height) +
                            "/" + std::to_string(target_height) + " - forcing recovery");
 
-                  // CRITICAL FIX: Clear ALL global requested indices above current height
-                  // This handles orphaned indices that got stuck without per-peer tracking
-                  // Without this, fill_index_pipeline skips them forever!
+                  // CRITICAL FIX: Clear ALL global requested indices during recovery
+                  // This handles orphaned indices stuck without per-peer tracking.
+                  // We must clear BOTH:
+                  // - Indices <= chain_height: already processed, should never block future requests
+                  // - Indices > chain_height: may be orphaned from disconnected peers
+                  // Since we're clearing all per-peer tracking below, just clear everything here.
                   {
                       InflightLock lk(g_inflight_lock);
-                      size_t cleared = 0;
-                      for (auto it = g_global_requested_indices.begin(); it != g_global_requested_indices.end(); ) {
-                          if (*it > chain_height) {
-                              it = g_global_requested_indices.erase(it);
-                              cleared++;
-                          } else {
-                              ++it;
-                          }
-                      }
+                      size_t cleared = g_global_requested_indices.size();
+                      g_global_requested_indices.clear();
                       if (cleared > 0) {
-                          log_info("P2P: Cleared " + std::to_string(cleared) + " orphaned indices from global tracking");
+                          log_info("P2P: Cleared " + std::to_string(cleared) + " global indices from tracking (forced recovery)");
                       }
                   }
 
@@ -6367,6 +6382,37 @@ void P2P::loop(){
               if (tnow - last_orphan_cleanup_ms > 200) {  // Every 200ms - INSTANT RECOVERY
                   last_orphan_cleanup_ms = tnow;
 
+                  // First, clear stale indices (already processed) from per-peer tracking
+                  // This is CRITICAL to prevent stuck indices that block sync forever
+                  const uint64_t chain_ht = chain_.height();
+                  size_t stale_peer_cleared = 0;
+                  for (auto& kv : g_inflight_index_ts) {
+                      std::vector<uint64_t> to_remove;
+                      for (const auto& idx_kv : kv.second) {
+                          if (idx_kv.first <= chain_ht) {
+                              to_remove.push_back(idx_kv.first);
+                          }
+                      }
+                      for (uint64_t idx : to_remove) {
+                          kv.second.erase(idx);
+                          stale_peer_cleared++;
+                      }
+                  }
+                  // Also clear from per-peer order queues
+                  for (auto& kv : g_inflight_index_order) {
+                      auto& dq = kv.second;
+                      auto new_end = std::remove_if(dq.begin(), dq.end(),
+                          [chain_ht](uint64_t idx) { return idx <= chain_ht; });
+                      if (new_end != dq.end()) {
+                          stale_peer_cleared += std::distance(new_end, dq.end());
+                          dq.erase(new_end, dq.end());
+                      }
+                  }
+                  if (stale_peer_cleared > 0) {
+                      log_info("P2P: Cleared " + std::to_string(stale_peer_cleared) +
+                               " stale indices from per-peer tracking (height=" + std::to_string(chain_ht) + ")");
+                  }
+
                   // Build set of ALL indices currently tracked by ANY peer
                   std::unordered_set<uint64_t> peer_tracked_indices;
                   for (const auto& kv : g_inflight_index_ts) {
@@ -6376,18 +6422,34 @@ void P2P::loop(){
                   }
 
                   // Find orphaned indices (in global but not tracked by any peer)
+                  // Also find stale indices (already processed - idx <= chain_height)
+                  const uint64_t current_height = chain_.height();
                   std::vector<uint64_t> orphaned;
+                  std::vector<uint64_t> stale;
                   {
                       InflightLock lk(g_inflight_lock);
                       for (uint64_t idx : g_global_requested_indices) {
-                          if (peer_tracked_indices.find(idx) == peer_tracked_indices.end()) {
+                          if (idx <= current_height) {
+                              // CRITICAL FIX: Index is already processed - remove it!
+                              // This prevents stuck indices like 176 when height is 1690
+                              stale.push_back(idx);
+                          } else if (peer_tracked_indices.find(idx) == peer_tracked_indices.end()) {
                               orphaned.push_back(idx);
                           }
                       }
-                      // Remove orphaned indices from global tracking
+                      // Remove stale and orphaned indices from global tracking
+                      for (uint64_t idx : stale) {
+                          g_global_requested_indices.erase(idx);
+                      }
                       for (uint64_t idx : orphaned) {
                           g_global_requested_indices.erase(idx);
                       }
+                  }
+
+                  if (!stale.empty()) {
+                      log_info("P2P: Cleared " + std::to_string(stale.size()) +
+                               " stale indices from global tracking (already processed, first: " +
+                               std::to_string(stale[0]) + ")");
                   }
 
                   if (!orphaned.empty()) {
@@ -6396,6 +6458,7 @@ void P2P::loop(){
                                std::to_string(orphaned[0]) + ")");
 
                       // Re-request orphaned indices from available peers
+                      // Note: Only orphaned (not stale) indices are re-requested
                       for (uint64_t idx : orphaned) {
                           // Find best peer to request from
                           Sock target = MIQ_INVALID_SOCK;
