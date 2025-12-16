@@ -4380,10 +4380,10 @@ void P2P::evict_pending_blocks_if_needed() {
     uint64_t current_height = chain_.height();
     int64_t now = now_ms();
 
-    // CRITICAL FIX: Also remove blocks that have been waiting too long (30 seconds)
-    // If a block has been pending for 30s, its predecessor likely failed to arrive.
+    // CRITICAL FIX: Also remove blocks that have been waiting too long (2 minutes)
+    // If a block has been pending for 2 min, its predecessor likely failed to arrive.
     // Clear it from pending AND global so it can be re-requested.
-    static constexpr int64_t PENDING_BLOCK_TIMEOUT_MS = 30000;
+    static constexpr int64_t PENDING_BLOCK_TIMEOUT_MS = 120000;
 
     // Remove blocks at or below current height (already processed)
     // Also remove blocks that have timed out waiting for predecessors

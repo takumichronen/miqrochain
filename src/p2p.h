@@ -278,7 +278,7 @@ struct PeerState {
     int64_t last_batch_duration_ms{0};          // How long last batch took
 
     // Timeout tracking
-    int64_t avg_block_delivery_ms{30000};       // Running average delivery time (default 30s)
+    int64_t avg_block_delivery_ms{5000};        // Running average delivery time (default 5s)
     
     // Connection quality tracking (FIX: added for better sync management)
     int64_t last_activity_ms{0};                // Last meaningful activity
