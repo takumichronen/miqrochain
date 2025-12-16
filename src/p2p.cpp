@@ -5685,18 +5685,9 @@ void P2P::loop(){
                     for (const auto& kv : peers_) {
                         const auto& ps = kv.second;
                         if (!ps.verack_ok) continue;
-                        // CRITICAL FIX: Include inflight_index in non-responsive check
-                        // Peer has health < 20%, never delivered a block, but has 64+ inflight
-                        size_t total_inflight = ps.inflight_blocks.size() + ps.inflight_index;
-                        bool is_non_responsive = (ps.health_score < 0.20) &&
-                                                 (ps.blocks_delivered_successfully == 0) &&
-                                                 (total_inflight >= 64);
-                        if (is_non_responsive) {
-                            log_warn("P2P: disconnecting non-responsive peer " + ps.ip +
-                                    " (health=" + std::to_string((int)(ps.health_score * 100)) + "%" +
-                                    " blocks=" + std::to_string(ps.blocks_delivered_successfully) +
-                                    " inflight=" + std::to_string(total_inflight) + ")");
-                            dead_peer_ips.push_back(ps.ip);
+                        if (ps.blocks_delivered_successfully > 0 || ps.total_blocks_received > 0) {
+                            any_peer_delivered = true;
+                            break;
                         }
                     }
 
@@ -5710,14 +5701,17 @@ void P2P::loop(){
                         for (const auto& kv : peers_) {
                             const auto& ps = kv.second;
                             if (!ps.verack_ok) continue;
+                            // CRITICAL FIX: Include inflight_index in non-responsive check
                             // Peer has health < 20%, never delivered a block, but has 64+ inflight
+                            size_t total_inflight = ps.inflight_blocks.size() + ps.inflight_index;
                             bool is_non_responsive = (ps.health_score < 0.20) &&
-                                                     (ps.total_blocks_received == 0) &&
-                                                     (ps.inflight_blocks.size() >= 64);
+                                                     (ps.blocks_delivered_successfully == 0) &&
+                                                     (total_inflight >= 64);
                             if (is_non_responsive) {
                                 log_warn("P2P: disconnecting non-responsive peer " + ps.ip +
                                         " (health=" + std::to_string((int)(ps.health_score * 100)) + "%" +
-                                        " blocks=0 inflight=" + std::to_string(ps.inflight_blocks.size()) + ")");
+                                        " blocks=" + std::to_string(ps.blocks_delivered_successfully) +
+                                        " inflight=" + std::to_string(total_inflight) + ")");
                                 dead_peer_ips.push_back(ps.ip);
                             }
                         }
