@@ -3793,6 +3793,12 @@ void P2P::fill_index_pipeline(PeerState& ps){
     if (ps.inflight_index >= 16 && ps.total_blocks_received == 0) {
         // Peer has 16+ requests pending but hasn't delivered a single block
         // Likely a dead or misbehaving peer - skip sending more requests
+        static int64_t last_log_ms = 0;
+        if (now_ms() - last_log_ms > 5000) {
+            last_log_ms = now_ms();
+            log_warn("[FILL-BLOCK] " + ps.ip + " blocked: inflight=" +
+                     std::to_string(ps.inflight_index) + " but blocks_received=0");
+        }
         return;
     }
 
@@ -3804,18 +3810,24 @@ void P2P::fill_index_pipeline(PeerState& ps){
     // If requests have been pending for > 5 seconds, they're likely dead.
     // Allow fresh requests to be sent while waiting for stale ones to timeout.
     // This prevents the "128 inflight, 0 received" deadlock where we wait 30+ seconds.
+    uint32_t fresh_inflight = 0;
+    uint32_t stale_inflight = 0;
+    int64_t oldest_request_age_ms = 0;
     {
         const int64_t tnow = now_ms();
         const int64_t STALE_AGE_MS = 5000;  // 5 seconds = stale
 
         // Count only FRESH requests (< 5 seconds old)
-        uint32_t fresh_inflight = 0;
         InflightLock lk(g_inflight_lock);
         auto it = g_inflight_index_ts.find((Sock)ps.sock);
         if (it != g_inflight_index_ts.end()) {
             for (const auto& kv : it->second) {
-                if (tnow - kv.second < STALE_AGE_MS) {
+                int64_t age = tnow - kv.second;
+                if (age > oldest_request_age_ms) oldest_request_age_ms = age;
+                if (age < STALE_AGE_MS) {
                     fresh_inflight++;
+                } else {
+                    stale_inflight++;
                 }
             }
         }
@@ -3823,6 +3835,13 @@ void P2P::fill_index_pipeline(PeerState& ps){
         // Use fresh count for cap, not total inflight
         // This allows sending new requests even when old ones are stale
         if (fresh_inflight >= 64) {
+            static int64_t last_log_ms = 0;
+            if (now_ms() - last_log_ms > 5000) {
+                last_log_ms = now_ms();
+                log_warn("[FILL-BLOCK] " + ps.ip + " blocked: fresh_inflight=" +
+                         std::to_string(fresh_inflight) + " >= 64 (stale=" +
+                         std::to_string(stale_inflight) + ")");
+            }
             return;
         }
     }
@@ -3890,13 +3909,28 @@ void P2P::fill_index_pipeline(PeerState& ps){
 
     // IBD DIAG: Track fill loop stats
     uint32_t loop_requests = 0;
+    uint32_t skipped_already_requested = 0;
+    uint32_t skipped_already_have = 0;
+
+    // Log entry into loop for debugging
+    static int64_t last_loop_log_ms = 0;
+    const bool should_log = (now_ms() - last_loop_log_ms > 10000);
 
     while (ps.inflight_index < pipe) {
         uint64_t idx = ps.next_index;
 
         // Backpressure: Stop if we're too far ahead of the tip or beyond header height
         if (idx > max_index) {
-            if (loop_requests == 0) g_diag_fill_blocked_max_index++;
+            if (loop_requests == 0) {
+                g_diag_fill_blocked_max_index++;
+                if (should_log) {
+                    last_loop_log_ms = now_ms();
+                    log_warn("[FILL-LOOP] " + ps.ip + " BLOCKED: idx=" + std::to_string(idx) +
+                             " > max_index=" + std::to_string(max_index) +
+                             " (height=" + std::to_string(chain_.height()) +
+                             " peer_limit=" + std::to_string(peer_limit) + ")");
+                }
+            }
             break;
         }
 
@@ -3909,6 +3943,7 @@ void P2P::fill_index_pipeline(PeerState& ps){
 
             if (!force_mode && g_global_requested_indices.count(idx)) {
                 g_diag_fill_blocked_already_requested++;
+                skipped_already_requested++;
 
                 // Another peer is already fetching this index, skip to next
                 ps.next_index++;
@@ -3951,6 +3986,20 @@ void P2P::fill_index_pipeline(PeerState& ps){
     // Track if we exited because pipe was full (couldn't request anything)
     if (loop_requests == 0 && ps.inflight_index >= pipe) {
         g_diag_fill_blocked_pipe_full++;
+    }
+
+    // Log summary if we didn't make any requests and should have
+    if (loop_requests == 0 && should_log && chain_.height() < peer_limit) {
+        last_loop_log_ms = now_ms();
+        log_warn("[FILL-SUMMARY] " + ps.ip + ": sent=0 skipped_requested=" +
+                 std::to_string(skipped_already_requested) +
+                 " skipped_have=" + std::to_string(skipped_already_have) +
+                 " inflight=" + std::to_string(ps.inflight_index) +
+                 " fresh=" + std::to_string(fresh_inflight) +
+                 " stale=" + std::to_string(stale_inflight) +
+                 " pipe=" + std::to_string(pipe) +
+                 " next=" + std::to_string(ps.next_index) +
+                 " max_idx=" + std::to_string(max_index));
     }
 }
 
@@ -6075,6 +6124,70 @@ void P2P::loop(){
                       }
                   }
                   any_peer_demoted = false;  // Already handled all peers
+              }
+          }
+
+          // ========================================================================
+          // SYNC DIAGNOSTIC LOG - Shows exactly what's happening every 5 seconds
+          // ========================================================================
+          {
+              static int64_t last_diag_ms = 0;
+              const int64_t tnow = now_ms();
+              if (tnow - last_diag_ms > 5000) {
+                  last_diag_ms = tnow;
+                  const uint64_t ch = chain_.height();
+                  const uint64_t hh = chain_.best_header_height();
+                  const uint64_t mp = g_max_known_peer_tip.load();
+
+                  // Count global tracking
+                  size_t global_indices = 0;
+                  {
+                      InflightLock lk(g_inflight_lock);
+                      global_indices = g_global_requested_indices.size();
+                  }
+
+                  // Build peer status string
+                  std::string peer_info;
+                  size_t total_fresh = 0, total_stale = 0, total_inflight = 0;
+                  for (const auto& kvp : peers_) {
+                      if (!kvp.second.verack_ok) continue;
+                      const auto& p = kvp.second;
+
+                      // Count fresh vs stale for this peer
+                      uint32_t fresh = 0, stale = 0;
+                      int64_t oldest_age = 0;
+                      {
+                          InflightLock lk(g_inflight_lock);
+                          auto it = g_inflight_index_ts.find(kvp.first);
+                          if (it != g_inflight_index_ts.end()) {
+                              for (const auto& kv : it->second) {
+                                  int64_t age = tnow - kv.second;
+                                  if (age > oldest_age) oldest_age = age;
+                                  if (age < 5000) fresh++; else stale++;
+                              }
+                          }
+                      }
+                      total_fresh += fresh;
+                      total_stale += stale;
+                      total_inflight += p.inflight_index;
+
+                      peer_info += "\n  " + p.ip + ": blks=" + std::to_string(p.total_blocks_received) +
+                                   " inflight=" + std::to_string(p.inflight_index) +
+                                   " fresh=" + std::to_string(fresh) +
+                                   " stale=" + std::to_string(stale) +
+                                   " oldest=" + std::to_string(oldest_age/1000) + "s" +
+                                   " next=" + std::to_string(p.next_index) +
+                                   " sync=" + (p.syncing ? "Y" : "N") +
+                                   " capable=" + (peer_is_index_capable(kvp.first) ? "Y" : "N");
+                  }
+
+                  log_info("[SYNC-DIAG] height=" + std::to_string(ch) + "/" + std::to_string(std::max(hh, mp)) +
+                           " global_tracked=" + std::to_string(global_indices) +
+                           " total_inflight=" + std::to_string(total_inflight) +
+                           " (fresh=" + std::to_string(total_fresh) +
+                           " stale=" + std::to_string(total_stale) + ")" +
+                           " pending_blocks=" + std::to_string(pending_blocks_.size()) +
+                           peer_info);
               }
           }
 
