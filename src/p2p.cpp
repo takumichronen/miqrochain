@@ -3763,18 +3763,25 @@ void P2P::fill_index_pipeline(PeerState& ps){
 
     // NON-RESPONSIVE PEER DETECTION: Skip peers that have high inflight but 0 delivered
     // This prevents wasting request slots on dead peers that accept connections but never respond
-    // Give new peers a chance (first 64 requests) before applying this filter
-    if (ps.inflight_index >= 64 && ps.blocks_delivered_successfully == 0) {
-        // Peer has 64+ requests pending but hasn't delivered a single block
+    // CRITICAL: Threshold lowered from 64 to 16 - stop flooding non-responders quickly
+    if (ps.inflight_index >= 16 && ps.blocks_delivered_successfully == 0) {
+        // Peer has 16+ requests pending but hasn't delivered a single block
         // Likely a dead or misbehaving peer - skip sending more requests
+        return;
+    }
+
+    // HEALTH-BASED CHECK: If peer's health has degraded significantly, stop sending new requests
+    // This catches peers whose requests are timing out repeatedly (each timeout decays health by 10%)
+    if (ps.health_score < 0.5 && ps.inflight_index >= 4) {
+        // Health below 50% and already has requests in flight - let existing requests complete first
         return;
     }
 
     // QUALITY-BASED THROTTLING: Limit inflight to low-quality peers
     // If a peer has delivered some blocks but has poor success rate, reduce pipeline
     if (ps.blocks_delivered_successfully > 0 && ps.blocks_failed_delivery > ps.blocks_delivered_successfully) {
-        // More failures than successes - limit pipeline to 32 to prevent wasting slots
-        if (ps.inflight_index >= 32) {
+        // More failures than successes - limit pipeline to 16 to prevent wasting slots
+        if (ps.inflight_index >= 16) {
             return;
         }
     }
@@ -5693,13 +5700,26 @@ void P2P::loop(){
             for (size_t i=0;i<32;i++) {
               h[i] = (uint8_t)((hexv(k[2*i])<<4) | hexv(k[2*i+1]));
             }
-            // Build candidate list sorted by health score (best peers first)
-            std::vector<std::pair<Sock, double>> cands_with_score;
-            cands_with_score.reserve(peers_.size());
+            // Build candidate list - PREFER peers that have delivered blocks
+            std::vector<std::pair<Sock, double>> delivering_cands;
+            std::vector<std::pair<Sock, double>> nondelivering_cands;
+            delivering_cands.reserve(peers_.size());
+            nondelivering_cands.reserve(peers_.size());
             for (auto& kv2 : peers_) {
               if (kv2.first == s_exp) continue;
               if (!kv2.second.verack_ok) continue;
-              cands_with_score.emplace_back(kv2.first, kv2.second.health_score);
+              if (kv2.second.total_blocks_received > 0) {
+                delivering_cands.emplace_back(kv2.first, kv2.second.health_score);
+              } else {
+                nondelivering_cands.emplace_back(kv2.first, kv2.second.health_score);
+              }
+            }
+            // Use delivering peers first, fall back to non-delivering
+            std::vector<std::pair<Sock, double>> cands_with_score;
+            if (!delivering_cands.empty()) {
+              cands_with_score = std::move(delivering_cands);
+            } else {
+              cands_with_score = std::move(nondelivering_cands);
             }
             // If no verack_ok yet (rare early), fall back to anyone but s_exp
             if (cands_with_score.empty()) {
@@ -5789,10 +5809,35 @@ void P2P::loop(){
             // Build candidate set excluding original socket
             std::vector<std::pair<Sock,double>> scored;
             mark_index_timeout(e.s);
+
+            // CRITICAL FIX: Decay health on index timeout too!
+            // Previously only hash-based timeouts decayed health (line 5676)
+            // This caused non-delivering peers to maintain 100% health forever
+            {
+                auto pit = peers_.find(e.s);
+                if (pit != peers_.end()) {
+                    pit->second.blocks_failed_delivery++;
+                    pit->second.health_score = std::max(0.1, pit->second.health_score * 0.9);
+                }
+            }
+
+            // PREFER peers that have delivered blocks over non-delivering peers
+            std::vector<std::pair<Sock,double>> delivering_scored;
+            std::vector<std::pair<Sock,double>> nondelivering_scored;
             for (auto &kvp : peers_){
               if (kvp.first == e.s) continue;
               if (!kvp.second.verack_ok) continue;
-              scored.emplace_back(kvp.first, kvp.second.health_score);
+              if (kvp.second.total_blocks_received > 0) {
+                delivering_scored.emplace_back(kvp.first, kvp.second.health_score);
+              } else {
+                nondelivering_scored.emplace_back(kvp.first, kvp.second.health_score);
+              }
+            }
+            // Use delivering peers first, fall back to non-delivering
+            if (!delivering_scored.empty()) {
+              scored = std::move(delivering_scored);
+            } else {
+              scored = std::move(nondelivering_scored);
             }
             Sock target = MIQ_INVALID_SOCK;
             if (!scored.empty()){
@@ -6572,14 +6617,32 @@ void P2P::loop(){
                                       " - NO HASH AVAILABLE from header chain!");
                           }
 
-                          // Find best peer
+                          // Find best peer - PREFER peers that have actually delivered blocks!
+                          // Peers with blocks=0 but health=100% are likely non-responsive
                           Sock target = MIQ_INVALID_SOCK;
                           double best_score = -1.0;
+                          bool found_delivering_peer = false;
+
+                          // First pass: find best peer that HAS delivered blocks
                           for (auto& kvp : peers_) {
                               if (!kvp.second.verack_ok) continue;
+                              if (kvp.second.total_blocks_received == 0) continue;  // Skip non-delivering peers
                               if (kvp.second.health_score > best_score) {
                                   best_score = kvp.second.health_score;
                                   target = kvp.first;
+                                  found_delivering_peer = true;
+                              }
+                          }
+
+                          // Second pass: if no delivering peer, fall back to any peer
+                          if (!found_delivering_peer) {
+                              best_score = -1.0;
+                              for (auto& kvp : peers_) {
+                                  if (!kvp.second.verack_ok) continue;
+                                  if (kvp.second.health_score > best_score) {
+                                      best_score = kvp.second.health_score;
+                                      target = kvp.first;
+                                  }
                               }
                           }
 
