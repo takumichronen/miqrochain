@@ -692,7 +692,65 @@ uint64_t Chain::best_header_height() const {
 bool Chain::get_header_hash_at_height(uint64_t target_height, std::vector<uint8_t>& out) const {
     MIQ_CHAIN_GUARD();
 
-    // Quick check: if height is at or below our block tip, use block chain
+    // REORG FIX: When best_header points to a different chain than our block tip,
+    // we MUST use the header chain walk, not the block chain lookup.
+    // The old code always used block chain for heights <= tip, which returned
+    // wrong hashes when trying to sync to a competing chain.
+
+    auto best_it = header_index_.find(best_header_key_);
+    bool have_best_header = (!best_header_key_.empty() && best_it != header_index_.end());
+
+    // Check if best header is on a DIFFERENT chain than our block tip
+    // This happens during reorgs when we know about a longer chain via headers
+    bool best_header_diverged = false;
+    if (have_best_header && tip_.height > 0 && best_it->second.height > tip_.height) {
+        // Best header is higher than our tip - could be on different chain
+        // Walk back from best_header to tip height and check if it matches our tip
+        std::vector<uint8_t> check_hash = best_it->second.hash;
+        uint64_t check_height = best_it->second.height;
+
+        while (check_height > tip_.height) {
+            auto it = header_index_.find(hk(check_hash));
+            if (it == header_index_.end()) break;
+            check_hash = it->second.prev;
+            check_height--;
+        }
+
+        // If the hash at tip height doesn't match our tip, chains have diverged
+        if (check_height == tip_.height && check_hash != tip_.hash) {
+            best_header_diverged = true;
+        }
+    }
+
+    // If chains have diverged OR target is above our tip, use header chain
+    if (best_header_diverged || target_height > tip_.height) {
+        if (!have_best_header) return false;
+
+        // If target height is beyond best header, fail
+        if (target_height > best_it->second.height) return false;
+
+        // Walk backwards from best header to find target height
+        std::vector<uint8_t> current_hash = best_it->second.hash;
+        uint64_t current_height = best_it->second.height;
+
+        while (current_height > target_height) {
+            auto it = header_index_.find(hk(current_hash));
+            if (it == header_index_.end()) return false;
+
+            current_hash = it->second.prev;
+            current_height--;
+        }
+
+        // Verify we found the right height
+        auto final_it = header_index_.find(hk(current_hash));
+        if (final_it == header_index_.end()) return false;
+        if (final_it->second.height != target_height) return false;
+
+        out = current_hash;
+        return true;
+    }
+
+    // Chains haven't diverged - use block chain for heights <= tip
     if (target_height <= tip_.height && tip_.height > 0) {
         Block b;
         if (get_block_by_index((size_t)target_height, b)) {
@@ -701,34 +759,7 @@ bool Chain::get_header_hash_at_height(uint64_t target_height, std::vector<uint8_
         }
     }
 
-    // Otherwise, walk header chain from best_header down to target height
-    if (best_header_key_.empty()) return false;
-
-    auto best_it = header_index_.find(best_header_key_);
-    if (best_it == header_index_.end()) return false;
-
-    // If target height is beyond best header, fail
-    if (target_height > best_it->second.height) return false;
-
-    // Walk backwards from best header to find target height
-    std::vector<uint8_t> current_hash = best_it->second.hash;
-    uint64_t current_height = best_it->second.height;
-
-    while (current_height > target_height) {
-        auto it = header_index_.find(hk(current_hash));
-        if (it == header_index_.end()) return false;
-
-        current_hash = it->second.prev;
-        current_height--;
-    }
-
-    // Verify we found the right height
-    auto final_it = header_index_.find(hk(current_hash));
-    if (final_it == header_index_.end()) return false;
-    if (final_it->second.height != target_height) return false;
-
-    out = current_hash;
-    return true;
+    return false;
 }
 
 bool Chain::accept_header(const BlockHeader& h, std::string& err) {
