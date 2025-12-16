@@ -5910,6 +5910,12 @@ void P2P::loop(){
                   g_global_requested_indices.insert(e.idx);
               }
               itT->second.inflight_index++;
+            } else {
+              // CRITICAL FIX: If retry send fails, DON'T lose the index!
+              // Leave it OUT of global tracking so gap detection can pick it up.
+              // Log a warning so we can track this happening.
+              log_warn("P2P: Index " + std::to_string(e.idx) +
+                      " retry send failed - leaving untracked for gap detection");
             }
           }
 
@@ -6726,14 +6732,25 @@ void P2P::loop(){
                                           }
                                       }
 
-                                      // NO getbi fallback - wait for headers
-                                      // If we don't have the hash, log and continue
+                                      // CRITICAL FIX: Use getbi when hash unavailable!
+                                      // Previously this just waited for headers, causing sync stalls
+                                      // when retry failed and gap detection couldn't request the block.
                                       if (!sent && !have_hash) {
-                                          static int64_t last_no_hash_log = 0;
-                                          if (tnow - last_no_hash_log > 5000) {
-                                              last_no_hash_log = tnow;
-                                              log_info("[SYNC] Gap at " + std::to_string(next_needed) +
-                                                      " - waiting for header (no getbi)");
+                                          // Fallback to index-based request
+                                          uint8_t p8[8];
+                                          for (int i = 0; i < 8; i++) p8[i] = (uint8_t)((next_needed >> (8 * i)) & 0xFF);
+                                          auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
+                                          if (send_or_close(target, msg)) {
+                                              {
+                                                  InflightLock lk(g_inflight_lock);
+                                                  g_global_requested_indices.insert(next_needed);
+                                              }
+                                              g_inflight_index_ts[target][next_needed] = tnow;
+                                              g_inflight_index_order[target].push_back(next_needed);
+                                              itT->second.inflight_index++;
+                                              sent = true;
+                                              log_info("[GAP] Requested block " + std::to_string(next_needed) +
+                                                      " using getbi (no header hash available)");
                                           }
                                       }
                                   }
@@ -6741,54 +6758,91 @@ void P2P::loop(){
                           } else if (gap_request_count <= 4) {
                               // CRITICAL FIX: Attempts 3-4 (6-8 seconds): Request from MULTIPLE delivering peers
                               // Don't wait 20+ seconds to try other peers!
-                              if (gap_request_count == 3 && have_hash) {
+                              if (gap_request_count == 3) {
                                   log_info("P2P: Gap at index " + std::to_string(next_needed) +
-                                           " - requesting from all delivering peers");
-                                  const std::string key = hexkey(block_hash);
+                                           " - requesting from all delivering peers" +
+                                           (have_hash ? " [hash-based]" : " [index-based]"));
                                   for (auto& kvp : peers_) {
                                       if (!kvp.second.verack_ok) continue;
                                       if (kvp.second.total_blocks_received == 0) continue;  // Only delivering peers
-                                      auto msg = encode_msg("getb", block_hash);
-                                      if (send_or_close(kvp.first, msg)) {
-                                          kvp.second.inflight_blocks.insert(key);
-                                          g_global_inflight_blocks.insert(key);
-                                          {
-                                              InflightLock lk(g_inflight_lock);
-                                              g_global_requested_indices.insert(next_needed);
+
+                                      if (have_hash) {
+                                          const std::string key = hexkey(block_hash);
+                                          auto msg = encode_msg("getb", block_hash);
+                                          if (send_or_close(kvp.first, msg)) {
+                                              kvp.second.inflight_blocks.insert(key);
+                                              g_global_inflight_blocks.insert(key);
+                                              {
+                                                  InflightLock lk(g_inflight_lock);
+                                                  g_global_requested_indices.insert(next_needed);
+                                              }
+                                              g_inflight_index_ts[kvp.first][next_needed] = tnow;
+                                              g_inflight_index_order[kvp.first].push_back(next_needed);
                                           }
-                                          g_inflight_index_ts[kvp.first][next_needed] = tnow;
-                                          g_inflight_index_order[kvp.first].push_back(next_needed);
+                                      } else {
+                                          // Fallback to getbi when hash unavailable
+                                          uint8_t p8[8];
+                                          for (int i = 0; i < 8; i++) p8[i] = (uint8_t)((next_needed >> (8 * i)) & 0xFF);
+                                          auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
+                                          if (send_or_close(kvp.first, msg)) {
+                                              {
+                                                  InflightLock lk(g_inflight_lock);
+                                                  g_global_requested_indices.insert(next_needed);
+                                              }
+                                              g_inflight_index_ts[kvp.first][next_needed] = tnow;
+                                              g_inflight_index_order[kvp.first].push_back(next_needed);
+                                              kvp.second.inflight_index++;
+                                          }
                                       }
                                   }
                               }
                           } else {
                               // CRITICAL FIX: Attempt 5+ (10 seconds): Broadcast to ALL peers
                               // Don't wait 30+ seconds - if delivering peers don't have it, try everyone!
-                              if (gap_request_count == 5 && have_hash) {
-                                  // HASH-BASED BROADCAST: Only if we have the header
+                              if (gap_request_count == 5) {
                                   log_warn("P2P: Gap at index " + std::to_string(next_needed) +
-                                           " - broadcasting to ALL peers (10s stuck) [hash-based]");
+                                           " - broadcasting to ALL peers (10s stuck)" +
+                                           (have_hash ? " [hash-based]" : " [index-based]"));
 
                                   int sent_count = 0;
-                                  const std::string key = hexkey(block_hash);
                                   for (auto& kvp : peers_) {
                                       if (!kvp.second.verack_ok) continue;
-                                      auto msg = encode_msg("getb", block_hash);
-                                      if (send_or_close(kvp.first, msg)) {
-                                          kvp.second.inflight_blocks.insert(key);
-                                          g_global_inflight_blocks.insert(key);
-                                          // CRITICAL FIX: Track by index too (only for first peer)
-                                          if (sent_count == 0) {
-                                              InflightLock lk(g_inflight_lock);
-                                              g_global_requested_indices.insert(next_needed);
-                                              g_inflight_index_ts[kvp.first][next_needed] = tnow;
-                                              g_inflight_index_order[kvp.first].push_back(next_needed);
+
+                                      if (have_hash) {
+                                          const std::string key = hexkey(block_hash);
+                                          auto msg = encode_msg("getb", block_hash);
+                                          if (send_or_close(kvp.first, msg)) {
+                                              kvp.second.inflight_blocks.insert(key);
+                                              g_global_inflight_blocks.insert(key);
+                                              // Track by index too (only for first peer)
+                                              if (sent_count == 0) {
+                                                  InflightLock lk(g_inflight_lock);
+                                                  g_global_requested_indices.insert(next_needed);
+                                                  g_inflight_index_ts[kvp.first][next_needed] = tnow;
+                                                  g_inflight_index_order[kvp.first].push_back(next_needed);
+                                              }
+                                              sent_count++;
                                           }
-                                          sent_count++;
+                                      } else {
+                                          // Fallback to getbi when hash unavailable
+                                          uint8_t p8[8];
+                                          for (int i = 0; i < 8; i++) p8[i] = (uint8_t)((next_needed >> (8 * i)) & 0xFF);
+                                          auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
+                                          if (send_or_close(kvp.first, msg)) {
+                                              if (sent_count == 0) {
+                                                  InflightLock lk(g_inflight_lock);
+                                                  g_global_requested_indices.insert(next_needed);
+                                                  g_inflight_index_ts[kvp.first][next_needed] = tnow;
+                                                  g_inflight_index_order[kvp.first].push_back(next_needed);
+                                              }
+                                              kvp.second.inflight_index++;
+                                              sent_count++;
+                                          }
                                       }
                                   }
                                   log_info("P2P: Broadcast gap " + std::to_string(next_needed) +
-                                           " to " + std::to_string(sent_count) + " peers [hash-based]");
+                                           " to " + std::to_string(sent_count) + " peers" +
+                                           (have_hash ? " [hash-based]" : " [index-based]"));
                               }
                               // After broadcast, wait 30 more seconds before trying again
                               // gap_request_count will keep incrementing but we won't spam
