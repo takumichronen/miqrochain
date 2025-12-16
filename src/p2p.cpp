@@ -1587,10 +1587,12 @@ static inline int64_t adaptive_index_timeout_ms(const miq::PeerState& ps){
     //      and slow down sync when seeds are under load
     // Near-tip: Need shorter timeouts for sub-second block propagation
 
-    // CRITICAL FIX: Unproven peers get SHORT timeout (3s)
-    // This quickly identifies dead/non-responsive peers instead of waiting forever
+    // Unproven peers get moderate timeout during IBD, shorter after
+    // Don't be too aggressive - network latency varies
     if (ps.total_blocks_received == 0) {
-        return 3000;  // 3 seconds for unproven peers - fail fast!
+        // During IBD: 10s to allow for slow seeds
+        // After IBD: 5s for faster detection
+        return !g_logged_headers_done ? 10000 : 5000;
     }
 
     // Base on observed block delivery; halve it for indices (headers+lookup are lighter).
@@ -3736,16 +3738,18 @@ void P2P::fill_index_pipeline(PeerState& ps){
         // Use adaptive batch size, but cap at MIQ_INDEX_PIPELINE
         pipe = std::min(ps.adaptive_batch_size, (uint32_t)MIQ_INDEX_PIPELINE);
 
-        // CRITICAL FIX: Limit pipeline for UNPROVEN peers
-        // Don't flood new peers with 512 requests - start small until they prove themselves
-        // Unproven: max 16 requests. After 50 deliveries: full pipeline
+        // Limit pipeline for UNPROVEN peers, but not too aggressively
+        // During IBD: allow 64 requests to unproven peers (seeds need time)
+        // After IBD: stricter limits for new peers
         if (ps.total_blocks_received == 0) {
-            pipe = std::min(pipe, 16u);  // New peer: max 16 requests until first delivery
-        } else if (ps.total_blocks_received < 50) {
-            // Ramping up: allow more as they deliver more
-            pipe = std::min(pipe, (uint32_t)(16 + ps.total_blocks_received));
+            // New peer: 64 during IBD, 32 after
+            uint32_t limit = !g_logged_headers_done ? 64u : 32u;
+            pipe = std::min(pipe, limit);
+        } else if (ps.total_blocks_received < 100) {
+            // Ramping up: 64 base + delivered blocks
+            pipe = std::min(pipe, (uint32_t)(64 + ps.total_blocks_received));
         }
-        // After 50+ deliveries: full pipeline allowed
+        // After 100+ deliveries: full pipeline allowed
     }
 
     // peer_is_index_capable is set by start_sync_with_peer
@@ -3780,25 +3784,23 @@ void P2P::fill_index_pipeline(PeerState& ps){
 
     // NON-RESPONSIVE PEER DETECTION: Skip peers that have high inflight but 0 delivered
     // This prevents wasting request slots on dead peers that accept connections but never respond
-    // CRITICAL: Threshold lowered from 64 to 16 - stop flooding non-responders quickly
-    if (ps.inflight_index >= 16 && ps.blocks_delivered_successfully == 0) {
+    // CRITICAL: Only applies to peers that have NEVER delivered a single block
+    if (ps.inflight_index >= 16 && ps.total_blocks_received == 0) {
         // Peer has 16+ requests pending but hasn't delivered a single block
         // Likely a dead or misbehaving peer - skip sending more requests
         return;
     }
 
-    // HEALTH-BASED CHECK: If peer's health has degraded significantly, stop sending new requests
-    // This catches peers whose requests are timing out repeatedly (each timeout decays health by 10%)
-    if (ps.health_score < 0.5 && ps.inflight_index >= 4) {
-        // Health below 50% and already has requests in flight - let existing requests complete first
-        return;
-    }
+    // NOTE: Removed health-based throttle - it was too aggressive and caused sync stalls
+    // A peer that has delivered blocks should continue getting requests even if health is low
+    // The timeout mechanism will handle non-responsive peers
 
-    // QUALITY-BASED THROTTLING: Limit inflight to low-quality peers
-    // If a peer has delivered some blocks but has poor success rate, reduce pipeline
-    if (ps.blocks_delivered_successfully > 0 && ps.blocks_failed_delivery > ps.blocks_delivered_successfully) {
-        // More failures than successes - limit pipeline to 16 to prevent wasting slots
-        if (ps.inflight_index >= 16) {
+    // QUALITY-BASED THROTTLING: Only throttle peers with VERY poor track record
+    // Must have delivered at least 50 blocks AND have 3x more failures than successes
+    if (ps.blocks_delivered_successfully >= 50 &&
+        ps.blocks_failed_delivery > ps.blocks_delivered_successfully * 3) {
+        // Extreme failure rate - limit pipeline to 32 to prevent wasting too many slots
+        if (ps.inflight_index >= 32) {
             return;
         }
     }
@@ -5700,14 +5702,17 @@ void P2P::loop(){
             // Final adaptive timeout
             int64_t adaptive_timeout = (int64_t)(base_timeout * health_multiplier * ibd_multiplier);
 
-            // CRITICAL FIX: Aggressive timeouts to prevent forks
-            // Unproven: 5s max. Proven during IBD: 20s max. Proven after IBD: 15s max.
+            // Timeout limits - balance between fast detection and network latency tolerance
+            // During IBD: be patient, network latency to seeds can be high
+            // After IBD: tighter timeouts for fast propagation
             int64_t min_timeout = 5000;
             int64_t max_timeout;
             if (ps.total_blocks_received == 0) {
-                max_timeout = 5000;  // Unproven: 5s max - fail fast
+                // Unproven peers: 15s during IBD, 8s after (allow for network latency)
+                max_timeout = !g_logged_headers_done ? 15000 : 8000;
             } else {
-                max_timeout = !g_logged_headers_done ? 20000 : 15000;  // Proven: 20s/15s
+                // Proven peers: 20s during IBD, 15s after
+                max_timeout = !g_logged_headers_done ? 20000 : 15000;
             }
             adaptive_timeout = std::max(min_timeout, std::min(max_timeout, adaptive_timeout));
 
