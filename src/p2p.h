@@ -227,6 +227,7 @@ struct PeerState {
     // per-peer RX buffer & liveness
     std::vector<uint8_t> rx;
     bool        verack_ok{false};
+    bool        received_verack{false};  // True only if peer sent verack (stricter check)
     int64_t     last_ping_ms{0};
     bool        awaiting_pong{false};
     int         banscore{0};

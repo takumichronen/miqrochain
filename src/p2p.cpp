@@ -1378,6 +1378,78 @@ static void remove_file_scope_inflight(const std::string& hash) {
 }
 
 static std::unordered_map<Sock,int> g_index_timeouts;
+
+// ============================================================================
+// IP REPUTATION HISTORY - Persists across reconnections
+// ============================================================================
+// Problem: Bad peers disconnect and reconnect with fresh health=100%, wasting slots.
+// Solution: Track per-IP history that survives reconnections.
+struct IPReputationHistory {
+    int64_t  total_blocks_delivered{0};    // Lifetime blocks from this IP
+    int64_t  total_blocks_failed{0};       // Lifetime failures from this IP
+    int64_t  total_connections{0};         // How many times this IP connected
+    int64_t  last_disconnect_ms{0};        // When they last disconnected
+    double   last_reputation{1.0};         // Last known reputation score
+    bool     proven_good{false};           // Has this IP ever delivered >100 blocks?
+};
+static std::unordered_map<std::string, IPReputationHistory> g_ip_history;
+static std::mutex g_ip_history_mutex;
+
+// Get starting batch size for an IP based on history
+static inline uint32_t get_ip_starting_batch(const std::string& ip) {
+    std::lock_guard<std::mutex> lk(g_ip_history_mutex);
+    auto it = g_ip_history.find(ip);
+    if (it == g_ip_history.end()) {
+        // Never seen this IP before - start VERY conservatively
+        return 32;  // Start with small batch
+    }
+    const auto& hist = it->second;
+    if (hist.proven_good) {
+        // This IP has delivered >100 blocks in the past - trust it
+        return 128;
+    }
+    if (hist.total_blocks_delivered == 0 && hist.total_connections > 0) {
+        // Has connected before but NEVER delivered anything - very suspicious
+        return 16;
+    }
+    // Has some history - scale based on past success rate
+    int64_t total = hist.total_blocks_delivered + hist.total_blocks_failed;
+    if (total == 0) return 32;
+    double success_rate = (double)hist.total_blocks_delivered / (double)total;
+    if (success_rate > 0.9) return 128;
+    if (success_rate > 0.7) return 64;
+    if (success_rate > 0.5) return 32;
+    return 16;  // Poor history
+}
+
+// Record that a peer from this IP is connecting
+static inline void record_ip_connect(const std::string& ip) {
+    std::lock_guard<std::mutex> lk(g_ip_history_mutex);
+    g_ip_history[ip].total_connections++;
+}
+
+// Record block delivery success/failure for IP history
+static inline void record_ip_block_result(const std::string& ip, bool success) {
+    std::lock_guard<std::mutex> lk(g_ip_history_mutex);
+    auto& hist = g_ip_history[ip];
+    if (success) {
+        hist.total_blocks_delivered++;
+        if (hist.total_blocks_delivered >= 100) {
+            hist.proven_good = true;
+        }
+    } else {
+        hist.total_blocks_failed++;
+    }
+}
+
+// Record peer disconnect and save final reputation
+static inline void record_ip_disconnect(const std::string& ip, double final_reputation) {
+    std::lock_guard<std::mutex> lk(g_ip_history_mutex);
+    auto& hist = g_ip_history[ip];
+    hist.last_disconnect_ms = now_ms();
+    hist.last_reputation = final_reputation;
+}
+
 static inline void mark_index_timeout(Sock s){
     // CRITICAL FIX: Only increment the counter here, don't set g_peer_index_capable!
     // The demotion should happen ONLY in the dedicated demotion loop (line ~5305)
@@ -1486,7 +1558,16 @@ static int64_t g_stall_retry_ms = MIQ_P2P_STALL_RETRY_MS;
 // BULLETPROOF SYNC: Global deduplication for index-based block requests
 // Prevents multiple peers from requesting the same block height simultaneously,
 // which wastes bandwidth and can create duplicate orphans causing sync issues.
+// STALL FIX: Now tracks timestamp so we can allow parallel requests after delay
 static std::unordered_set<uint64_t> g_global_requested_indices;
+static std::unordered_map<uint64_t, int64_t> g_global_requested_indices_ts;  // index -> request timestamp
+static constexpr int64_t SPECULATIVE_REQUEST_DELAY_MS = 2000;  // Allow 2nd peer after 2s
+
+// Helper: Clear index from both tracking maps (must be called with lock held)
+static inline void clear_global_requested_index(uint64_t idx) {
+    g_global_requested_indices.erase(idx);
+    g_global_requested_indices_ts.erase(idx);
+}
 
 // ============================================================================
 // SYNC DIAGNOSTICS: Track exactly what's happening during block sync
@@ -1665,19 +1746,38 @@ static inline void update_peer_reputation(miq::PeerState& ps) {
 
 // Calculate adaptive batch size based on peer reputation and network conditions
 static inline uint32_t calculate_adaptive_batch_size(const miq::PeerState& ps) {
-    // AGGRESSIVE: Much larger batch sizes for FAST sync
-    // For small chains (5-10k blocks), sync should be nearly instant
+    // CRITICAL FIX: Don't blindly trust new peers with huge batches!
+    // Problem: New peers get rep=1.0, get 256 requests, never deliver, waste slots.
+    // Solution: Start with IP-based limit, only ramp up AFTER peer proves itself.
 
     double rep = ps.reputation_score;
     uint32_t batch_size;
 
-    // During IBD: MAXIMUM AGGRESSION - request as many blocks as possible
+    // STEP 1: Check if peer has proven itself THIS SESSION
+    // A peer is "proven" if they've delivered at least 10 blocks
+    bool peer_proven_this_session = (ps.blocks_delivered_successfully >= 10);
+
+    // STEP 2: Get IP-based starting limit (survives reconnects)
+    uint32_t ip_limit = get_ip_starting_batch(ps.ip);
+
+    // During IBD: adaptive based on proven status
     if (!g_logged_headers_done) {
-        // IBD mode: huge batches for fast sync
-        if (rep >= 0.5) {
-            batch_size = 256;  // Request 256 blocks at once during IBD
+        if (peer_proven_this_session) {
+            // Peer has proven themselves this session - allow large batches
+            if (rep >= 0.5) {
+                batch_size = 256;
+            } else {
+                batch_size = 128;
+            }
         } else {
-            batch_size = 128;  // Even poor peers get large batches during IBD
+            // Peer has NOT proven themselves yet - use IP history limit
+            // This prevents reconnecting bad peers from immediately getting 256 requests
+            batch_size = ip_limit;
+
+            // Allow gradual ramp up based on current session delivery
+            if (ps.blocks_delivered_successfully >= 5) {
+                batch_size = std::min(batch_size * 2, (uint32_t)128);
+            }
         }
     } else {
         // Post-IBD: normal operation with reasonable batches
@@ -3161,6 +3261,9 @@ bool P2P::connect_seed(const std::string& host, uint16_t port){
 
     log_info("Peer: connected → " + ps.ip);
 
+    // CRITICAL: Track IP connection for reputation history
+    record_ip_connect(ps.ip);
+
     // Gate first, then mark loopback (so flag actually sticks)
     gate_on_connect(s);
     if (parse_ipv4(ps.ip, be_ip)) {
@@ -3273,6 +3376,9 @@ void P2P::handle_new_peer(Sock c, const std::string& ip){
     }
 
     log_info("P2P: inbound peer " + ip);
+
+    // CRITICAL: Track IP connection for reputation history
+    record_ip_connect(ip);
 
     // Gate first, then mark loopback (critical for localhost wallet)
     gate_on_connect(c);
@@ -3937,17 +4043,31 @@ void P2P::fill_index_pipeline(PeerState& ps){
         // BULLETPROOF SYNC: Skip if this index is already being requested by another peer
         // This prevents duplicate requests that waste bandwidth and create duplicate orphans
         // FORCE-COMPLETION: In force mode, allow duplicate requests for faster completion
+        // STALL FIX: Allow speculative parallel requests after SPECULATIVE_REQUEST_DELAY_MS
+        // This prevents stalls when one peer is slow - another peer can start helping
         {
             InflightLock lk(g_inflight_lock);
             const bool force_mode = g_force_completion_mode.load(std::memory_order_relaxed);
 
             if (!force_mode && g_global_requested_indices.count(idx)) {
-                g_diag_fill_blocked_already_requested++;
-                skipped_already_requested++;
+                // Check if the original request is stale (taking too long)
+                auto ts_it = g_global_requested_indices_ts.find(idx);
+                bool allow_speculative = false;
+                if (ts_it != g_global_requested_indices_ts.end()) {
+                    int64_t age_ms = now_ms() - ts_it->second;
+                    if (age_ms >= SPECULATIVE_REQUEST_DELAY_MS) {
+                        // Original request is stale - allow speculative parallel request
+                        allow_speculative = true;
+                    }
+                }
 
-                // Another peer is already fetching this index, skip to next
-                ps.next_index++;
-                continue;
+                if (!allow_speculative) {
+                    g_diag_fill_blocked_already_requested++;
+                    // Another peer is already fetching this index, skip to next
+                    ps.next_index++;
+                    continue;
+                }
+                // Allow speculative request - don't increment next_index, send the request
             }
         }
 
@@ -4051,11 +4171,16 @@ bool P2P::request_block_index(PeerState& ps, uint64_t index){
             {
                 InflightLock lk(g_inflight_lock);
                 if (!force_mode && g_global_requested_indices.count(index)) {
-                    return false;  // Already being requested
+                    // Check if we should allow speculative request (stale original)
+                    auto ts_it = g_global_requested_indices_ts.find(index);
+                    if (ts_it == g_global_requested_indices_ts.end() ||
+                        (now_ms() - ts_it->second) < SPECULATIVE_REQUEST_DELAY_MS) {
+                        return false;  // Already being requested and not stale
+                    }
+                    // Stale - allow speculative request (don't insert again, just update ts)
                 }
                 g_global_requested_indices.insert(index);
-                g_inflight_index_ts[(Sock)ps.sock][index] = req_time;
-                g_inflight_index_order[(Sock)ps.sock].push_back(index);
+                g_global_requested_indices_ts[index] = now_ms();  // STALL FIX: Track request time
             }
 
             // Use hash-based request
@@ -4069,10 +4194,7 @@ bool P2P::request_block_index(PeerState& ps, uint64_t index){
             // Send failed - remove from tracking
             {
                 InflightLock lk(g_inflight_lock);
-                g_global_requested_indices.erase(index);
-                g_inflight_index_ts[(Sock)ps.sock].erase(index);
-                auto& order = g_inflight_index_order[(Sock)ps.sock];
-                order.erase(std::remove(order.begin(), order.end(), index), order.end());
+                clear_global_requested_index(index);
             }
             return false;
         }
@@ -4821,6 +4943,9 @@ static void update_peer_performance(PeerState& ps, const std::string& block_hex,
             ps.last_block_received_ms = now_ms;
             ps.blocks_delivered_successfully++;
 
+            // CRITICAL: Record block success in IP history (survives reconnects)
+            record_ip_block_result(ps.ip, true);
+
             // Calculate exponential moving average (EMA) with alpha=0.2
             // This gives more weight to recent deliveries
             if (ps.total_blocks_received == 1) {
@@ -4992,6 +5117,29 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
         auto pit = peers_.find(sock);
         if (pit != peers_.end()) {
             update_peer_performance(pit->second, hexkey(bh), g_inflight_block_ts, now_ms());
+
+            // CRITICAL FIX: Decrement inflight_index when hash-based block arrives!
+            // CRITICAL FIX: Clear this block from ALL peers' inflight tracking!
+            // With speculative parallel requests, multiple peers may have requested
+            // the same block. When it arrives, ALL peers need their inflight_index
+            // decremented, not just the delivering peer.
+            {
+                InflightLock lk(g_inflight_lock);
+                // Clear from ALL peers' tracking (not just delivering peer)
+                for (auto& idx_kv : g_inflight_index_ts) {
+                    Sock peer_sock = idx_kv.first;
+                    auto& peer_indices = idx_kv.second;
+                    if (peer_indices.erase(block_height) > 0) {
+                        // This peer had this block inflight - decrement their counter
+                        auto peer_it = peers_.find(peer_sock);
+                        if (peer_it != peers_.end() && peer_it->second.inflight_index > 0) {
+                            peer_it->second.inflight_index--;
+                        }
+                    }
+                }
+                // Clear from global requested indices
+                clear_global_requested_index(block_height);
+            }
         }
         g_rr_next_idx.erase(hexkey(bh));
 
@@ -5267,6 +5415,8 @@ void P2P::loop(){
                          g_peer_index_capable[s] = false;
                          g_trickle_last_ms[s] = 0;
                          log_info("P2P: outbound (addrman) " + ps.ip);
+                         // CRITICAL: Track IP connection for reputation history
+                         record_ip_connect(ps.ip);
                          miq_set_keepalive(s);
                          gate_on_connect(s);
                          if (is_v4) gate_set_loopback(s, is_loopback_be(be_ip));
@@ -5340,6 +5490,8 @@ void P2P::loop(){
                                 g_trickle_last_ms[s] = 0;
 
                                 log_info("P2P: outbound to known " + ps.ip);
+                                // CRITICAL: Track IP connection for reputation history
+                                record_ip_connect(ps.ip);
                                 gate_on_connect(s);
                                 miq_set_keepalive(s);
                                 gate_set_loopback(s, is_loopback_be(pick));
@@ -5468,23 +5620,24 @@ void P2P::loop(){
                 int64_t stall_duration_ms = tnow - g_last_progress_ms;
                 log_info("P2P: stall detected - no height progress for " + std::to_string(stall_duration_ms / 1000) + "s (height=" + std::to_string(h) + ", peers=" + std::to_string(peers_.size()) + ")");
 
-                // STALL DIAGNOSTIC: Log global tracking state to identify stuck indices
+                // STALL DIAGNOSTIC: Log detailed state to find WHY we're stalled
                 {
                     InflightLock lk(g_inflight_lock);
-                    size_t global_count = g_global_requested_indices.size();
+                    size_t global_inflight = g_global_requested_indices.size();
+                    int64_t oldest_age_ms = 0;
                     uint64_t oldest_idx = 0;
-                    uint64_t stale_count = 0;
-                    for (uint64_t idx : g_global_requested_indices) {
-                        if (oldest_idx == 0 || idx < oldest_idx) oldest_idx = idx;
-                        if (idx <= h) stale_count++;
+                    for (const auto& kv : g_global_requested_indices_ts) {
+                        int64_t age = tnow - kv.second;
+                        if (age > oldest_age_ms) {
+                            oldest_age_ms = age;
+                            oldest_idx = kv.first;
+                        }
                     }
-                    if (global_count > 0) {
-                        log_info("P2P: STALL DIAGNOSTIC: global_indices=" + std::to_string(global_count) +
-                                " oldest_idx=" + std::to_string(oldest_idx) +
-                                " stale_count=" + std::to_string(stale_count) +
-                                " next_needed=" + std::to_string(h + 1) +
-                                " header_height=" + std::to_string(chain_.best_header_height()));
-                    }
+                    log_info("P2P: STALL DIAGNOSTIC: global_inflight=" + std::to_string(global_inflight) +
+                             " oldest_request_age=" + std::to_string(oldest_age_ms) + "ms" +
+                             " oldest_idx=" + std::to_string(oldest_idx) +
+                             " next_needed=" + std::to_string(h + 1) +
+                             " header_height=" + std::to_string(chain_.best_header_height()));
                 }
 
                 // Log peer health during stalls (helps diagnose slow peers)
@@ -5492,14 +5645,35 @@ void P2P::loop(){
                     std::string health_summary;
                     for (const auto& kv : peers_) {
                         if (!kv.second.verack_ok) continue;
+                        // CRITICAL FIX: Show inflight_index during IBD (that's what matters), not inflight_blocks
                         health_summary += "\n  " + kv.second.ip +
                                         ": health=" + std::to_string((int)(kv.second.health_score * 100)) + "%" +
                                         " avg_delivery=" + std::to_string(kv.second.avg_block_delivery_ms / 1000) + "s" +
-                                        " blocks=" + std::to_string(kv.second.total_blocks_received) +
-                                        " inflight=" + std::to_string(kv.second.inflight_blocks.size());
+                                        " blocks=" + std::to_string(kv.second.blocks_delivered_successfully) +
+                                        " inflight=" + std::to_string(kv.second.inflight_index);
                     }
                     if (!health_summary.empty()) {
                         log_info("P2P: peer health summary:" + health_summary);
+                    }
+
+                    // CRITICAL FIX: Proactively decay health for peers with high inflight but not delivering
+                    // This catches peers that are holding onto requests but not responding.
+                    // BUG: Previously, only timeouts decayed health, but a peer could have many
+                    // inflight requests that haven't timed out yet, maintaining artificially high health
+                    // while blocking sync progress.
+                    for (auto& kv : peers_) {
+                        auto& ps = kv.second;
+                        if (!ps.verack_ok) continue;
+                        // If peer has 64+ inflight_index requests but hasn't delivered anything recently,
+                        // decay their health. This prevents "phantom healthy" peers from hogging requests.
+                        // The stall itself indicates the peer isn't delivering.
+                        if (ps.inflight_index >= 64 && stall_duration_ms > 5000) {
+                            // Decay health proportionally to how much they're hogging
+                            // More inflight = more aggressive decay
+                            double decay = 0.95 - (0.1 * (ps.inflight_index / 256.0)); // 0.85-0.95
+                            decay = std::max(0.8, std::min(0.95, decay));
+                            ps.health_score = std::max(0.1, ps.health_score * decay);
+                        }
                     }
 
                     // DISCONNECT NON-RESPONSIVE PEERS
@@ -5509,9 +5683,20 @@ void P2P::loop(){
                     // until we've confirmed at least ONE peer can deliver blocks!
                     bool any_peer_delivered = false;
                     for (const auto& kv : peers_) {
-                        if (kv.second.total_blocks_received > 0) {
-                            any_peer_delivered = true;
-                            break;
+                        const auto& ps = kv.second;
+                        if (!ps.verack_ok) continue;
+                        // CRITICAL FIX: Include inflight_index in non-responsive check
+                        // Peer has health < 20%, never delivered a block, but has 64+ inflight
+                        size_t total_inflight = ps.inflight_blocks.size() + ps.inflight_index;
+                        bool is_non_responsive = (ps.health_score < 0.20) &&
+                                                 (ps.blocks_delivered_successfully == 0) &&
+                                                 (total_inflight >= 64);
+                        if (is_non_responsive) {
+                            log_warn("P2P: disconnecting non-responsive peer " + ps.ip +
+                                    " (health=" + std::to_string((int)(ps.health_score * 100)) + "%" +
+                                    " blocks=" + std::to_string(ps.blocks_delivered_successfully) +
+                                    " inflight=" + std::to_string(total_inflight) + ")");
+                            dead_peer_ips.push_back(ps.ip);
                         }
                     }
 
@@ -5836,12 +6021,9 @@ void P2P::loop(){
                 expired.emplace_back(bySock.first, kv.first);
                 // Track failed delivery for health score
                 ps.blocks_failed_delivery++;
-                // CRITICAL FIX: Decay less aggressively for peers that have delivered blocks
-                // Unproven peers (0 deliveries) decay by 10% per timeout
-                // Proven peers decay by only 0.5% per timeout (they've shown they can deliver)
-                // With 15% boost per delivery, a peer delivering 50% of requests will maintain health
-                double decay_factor = (ps.total_blocks_received > 0) ? 0.995 : 0.90;
-                ps.health_score = std::max(0.1, ps.health_score * decay_factor);
+                ps.health_score = std::max(0.1, ps.health_score * 0.9); // Decay health on timeout
+                // CRITICAL: Record block failure in IP history (survives reconnects)
+                record_ip_block_result(ps.ip, false);
               }
             }
           }
@@ -5956,6 +6138,14 @@ void P2P::loop(){
                     g_global_requested_indices.erase(idx);
                 }
                 if (ps.inflight_index > 0) ps.inflight_index--; // free a slot on original peer
+                // CRITICAL FIX: Decay health on index-based timeout (same as hash-based)
+                // BUG: Previously only hash-based timeouts decayed health (line 5657)
+                // Index-based timeouts didn't decay health, causing peers that don't respond
+                // to index requests to keep high health while actively-delivering peers got punished
+                ps.blocks_failed_delivery++;
+                ps.health_score = std::max(0.1, ps.health_score * 0.9);
+                // CRITICAL: Record block failure in IP history (survives reconnects)
+                record_ip_block_result(ps.ip, false);
               } else {
                 break; // front is still within timeout window
               }
@@ -8128,6 +8318,9 @@ void P2P::loop(){
                 // Log peer disconnection
                 log_info("Peer: disconnected ← " + ps_old.ip + " (remaining_peers=" + std::to_string(peers_.size() - 1) + ")");
 
+                // CRITICAL: Save peer's reputation to IP history before disconnect
+                record_ip_disconnect(ps_old.ip, ps_old.reputation_score);
+
                 // CRITICAL FIX: Record backoff time to prevent rapid reconnection
                 {
                     std::lock_guard<std::mutex> lk_backoff(g_reconnect_backoff_mu);
@@ -8377,6 +8570,11 @@ void P2P::loop(){
                         ps.verack_ok = true;
                         g_index_timeouts[(Sock)s] = 0;
 
+                        // CRITICAL FIX: Track whether we received verack from peer
+                        // Peers that don't send verack are suspicious and should NOT receive
+                        // block requests until they prove they're working
+                        ps.received_verack = strict_handshake;
+
                         // ================================================================
                         // BULLETPROOF FORK VERIFICATION
                         // Before syncing, verify peer is on the same chain by checking
@@ -8426,13 +8624,27 @@ void P2P::loop(){
                         } else {
                             // No checkpoint blocks yet (initial sync) - allow sync without verification
                             // Once we sync past checkpoints, new peers will be verified
-                            ps.fork_verified = true;  // Trust during initial sync
-                            g_peer_index_capable[(Sock)s] = true;
-                            ps.syncing = true;
-                            ps.next_index = our_height + 1;
-                            fill_index_pipeline(ps);
-                            log_info("P2P: Initial sync - skipping fork verification for " + ps.ip +
-                                    " (no checkpoint blocks yet)");
+
+                            // CRITICAL FIX: Do NOT start block sync with peers that haven't sent verack!
+                            // BUG: Peers that don't send verack were getting assigned 256 block requests,
+                            // never responding, getting disconnected, then reconnecting with fresh
+                            // health=100% and getting more requests. This caused sync stalls.
+                            if (!ps.received_verack) {
+                                log_warn("P2P: NOT starting sync with " + ps.ip +
+                                        " - peer hasn't sent verack (compatibility mode only)");
+                                // Allow basic communication but don't assign block requests
+                                ps.fork_verified = false;
+                                g_peer_index_capable[(Sock)s] = false;
+                                ps.syncing = false;
+                            } else {
+                                ps.fork_verified = true;  // Trust during initial sync
+                                g_peer_index_capable[(Sock)s] = true;
+                                ps.syncing = true;
+                                ps.next_index = our_height + 1;
+                                fill_index_pipeline(ps);
+                                log_info("P2P: Initial sync - skipping fork verification for " + ps.ip +
+                                        " (no checkpoint blocks yet)");
+                            }
                         }
 
                         const int64_t hs_ms = now_ms() - gg.t_conn_ms;
@@ -9273,6 +9485,8 @@ void P2P::loop(){
 
                             // Track as failed delivery for reputation scoring
                             ps.blocks_failed_delivery++;
+                            // CRITICAL: Record block failure in IP history (survives reconnects)
+                            record_ip_block_result(ps.ip, false);
 
                             // CRITICAL FIX: Don't retry if index exceeds header height
                             // This prevents endless retry loops for non-existent blocks
@@ -9441,6 +9655,9 @@ void P2P::loop(){
                             ps.total_block_delivery_time_ms += delivery_time_ms;
                             ps.total_blocks_received++;
                             ps.total_block_bytes_received += m.payload.size();
+
+                            // CRITICAL: Record block success in IP history (survives reconnects)
+                            record_ip_block_result(ps.ip, true);
 
                             // CRITICAL FIX: Recalculate health score on successful delivery
                             // Previously only timeouts affected health (decay), but deliveries didn't restore it
@@ -10329,6 +10546,8 @@ void P2P::loop(){
                     if (tnow - last_probe >= (int64_t)MIQ_P2P_STALL_RETRY_MS) {
                         // Track failed delivery (timeout) for reputation scoring
                         ps.blocks_failed_delivery++;
+                        // CRITICAL: Record block failure in IP history (survives reconnects)
+                        record_ip_block_result(ps.ip, false);
 
                         // Re-request the same *oldest* index on this peer (retry only; do NOT inflate inflight count).
                         request_block_index(ps, oldest_inflight);
@@ -10475,6 +10694,9 @@ void P2P::loop(){
 
                 // Always log peer disconnection for visibility
                 log_info("Peer: disconnected ← " + ip + " (remaining_peers=" + std::to_string(peers_.size() - 1) + ")");
+
+                // CRITICAL: Save peer's reputation to IP history before disconnect
+                record_ip_disconnect(ip, it->second.reputation_score);
 
                 if (it->second.sock != MIQ_INVALID_SOCK) {
                     CLOSESOCK(s);
