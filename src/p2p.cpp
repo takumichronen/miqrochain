@@ -3761,6 +3761,24 @@ void P2P::fill_index_pipeline(PeerState& ps){
         return;
     }
 
+    // NON-RESPONSIVE PEER DETECTION: Skip peers that have high inflight but 0 delivered
+    // This prevents wasting request slots on dead peers that accept connections but never respond
+    // Give new peers a chance (first 64 requests) before applying this filter
+    if (ps.inflight_index >= 64 && ps.blocks_delivered_successfully == 0) {
+        // Peer has 64+ requests pending but hasn't delivered a single block
+        // Likely a dead or misbehaving peer - skip sending more requests
+        return;
+    }
+
+    // QUALITY-BASED THROTTLING: Limit inflight to low-quality peers
+    // If a peer has delivered some blocks but has poor success rate, reduce pipeline
+    if (ps.blocks_delivered_successfully > 0 && ps.blocks_failed_delivery > ps.blocks_delivered_successfully) {
+        // More failures than successes - limit pipeline to 32 to prevent wasting slots
+        if (ps.inflight_index >= 32) {
+            return;
+        }
+    }
+
     // SYNC STATE FIX: Ensure next_index is consistent with current chain height
     const uint64_t current_height = chain_.height();
     if (ps.next_index <= current_height) {
