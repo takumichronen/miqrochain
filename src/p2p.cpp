@@ -6337,7 +6337,9 @@ void P2P::loop(){
 
                       // Reset sync state
                       kvp.second.syncing = true;
-                      // BITCOIN CORE FIX: Do NOT reset inflight_index
+                      // CRITICAL FIX: MUST reset inflight_index when clearing tracking!
+                      // The old comment was WRONG - it caused stalls.
+                      kvp.second.inflight_index = 0;
                       kvp.second.next_index = chain_height + 1;
 
                       // Clear per-peer inflight tracking
@@ -6467,6 +6469,12 @@ void P2P::loop(){
                   g_inflight_index_order.clear();
                   g_inflight_block_ts.clear();
                   g_global_inflight_blocks.clear();
+
+                  // CRITICAL FIX: Also reset inflight_index for all peers
+                  // Must stay in sync with g_inflight_index_ts
+                  for (auto& kvp : peers_) {
+                      kvp.second.inflight_index = 0;
+                  }
               }
           }
 
@@ -6571,7 +6579,10 @@ void P2P::loop(){
                           g_peer_index_capable[s] = true;
                           g_index_timeouts[s] = 0;
                           kvp.second.syncing = true;
-                          // BITCOIN CORE FIX: Do NOT reset inflight_index
+                          // CRITICAL FIX: MUST reset inflight_index when clearing tracking!
+                          // The old comment "Do NOT reset inflight_index" was WRONG and caused
+                          // stalls where inflight_index=256 but g_inflight_index_ts was empty.
+                          kvp.second.inflight_index = 0;
                           kvp.second.next_index = chain_height + 1;
                           // Fill pipeline
                           fill_index_pipeline(kvp.second);
