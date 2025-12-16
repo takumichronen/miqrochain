@@ -4864,6 +4864,29 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
         auto pit = peers_.find(sock);
         if (pit != peers_.end()) {
             update_peer_performance(pit->second, hexkey(bh), g_inflight_block_ts, now_ms());
+
+            // CRITICAL FIX: Decrement inflight_index when hash-based block arrives!
+            // BUG: fill_index_pipeline sends getb (hash-based) requests but increments inflight_index.
+            // When the "block" response arrives, inflight_index was NEVER decremented!
+            // This caused inflight_index to grow unbounded, blocking all new requests.
+            // The only decrement was in the "bi" handler (line ~8994), but hash-based
+            // requests return "block" messages, not "bi" messages.
+            if (pit->second.syncing && pit->second.inflight_index > 0) {
+                pit->second.inflight_index--;
+            }
+
+            // Also clear from index-based tracking maps (if this was a hash-based request for an index)
+            {
+                InflightLock lk(g_inflight_lock);
+                // Clear from g_inflight_index_ts for this peer
+                auto idx_it = g_inflight_index_ts.find(sock);
+                if (idx_it != g_inflight_index_ts.end()) {
+                    // The block at block_height was delivered - remove from tracking
+                    idx_it->second.erase(block_height);
+                }
+                // Clear from global requested indices
+                g_global_requested_indices.erase(block_height);
+            }
         }
         g_rr_next_idx.erase(hexkey(bh));
 
