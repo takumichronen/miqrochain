@@ -1558,7 +1558,16 @@ static int64_t g_stall_retry_ms = MIQ_P2P_STALL_RETRY_MS;
 // BULLETPROOF SYNC: Global deduplication for index-based block requests
 // Prevents multiple peers from requesting the same block height simultaneously,
 // which wastes bandwidth and can create duplicate orphans causing sync issues.
+// STALL FIX: Now tracks timestamp so we can allow parallel requests after delay
 static std::unordered_set<uint64_t> g_global_requested_indices;
+static std::unordered_map<uint64_t, int64_t> g_global_requested_indices_ts;  // index -> request timestamp
+static constexpr int64_t SPECULATIVE_REQUEST_DELAY_MS = 2000;  // Allow 2nd peer after 2s
+
+// Helper: Clear index from both tracking maps (must be called with lock held)
+static inline void clear_global_requested_index(uint64_t idx) {
+    g_global_requested_indices.erase(idx);
+    g_global_requested_indices_ts.erase(idx);
+}
 
 // ============================================================================
 // SYNC DIAGNOSTICS: Track exactly what's happening during block sync
@@ -3938,16 +3947,31 @@ void P2P::fill_index_pipeline(PeerState& ps){
         // BULLETPROOF SYNC: Skip if this index is already being requested by another peer
         // This prevents duplicate requests that waste bandwidth and create duplicate orphans
         // FORCE-COMPLETION: In force mode, allow duplicate requests for faster completion
+        // STALL FIX: Allow speculative parallel requests after SPECULATIVE_REQUEST_DELAY_MS
+        // This prevents stalls when one peer is slow - another peer can start helping
         {
             InflightLock lk(g_inflight_lock);
             const bool force_mode = g_force_completion_mode.load(std::memory_order_relaxed);
 
             if (!force_mode && g_global_requested_indices.count(idx)) {
-                g_diag_fill_blocked_already_requested++;
+                // Check if the original request is stale (taking too long)
+                auto ts_it = g_global_requested_indices_ts.find(idx);
+                bool allow_speculative = false;
+                if (ts_it != g_global_requested_indices_ts.end()) {
+                    int64_t age_ms = now_ms() - ts_it->second;
+                    if (age_ms >= SPECULATIVE_REQUEST_DELAY_MS) {
+                        // Original request is stale - allow speculative parallel request
+                        allow_speculative = true;
+                    }
+                }
 
-                // Another peer is already fetching this index, skip to next
-                ps.next_index++;
-                continue;
+                if (!allow_speculative) {
+                    g_diag_fill_blocked_already_requested++;
+                    // Another peer is already fetching this index, skip to next
+                    ps.next_index++;
+                    continue;
+                }
+                // Allow speculative request - don't increment next_index, send the request
             }
         }
 
@@ -4034,9 +4058,16 @@ bool P2P::request_block_index(PeerState& ps, uint64_t index){
             {
                 InflightLock lk(g_inflight_lock);
                 if (!force_mode && g_global_requested_indices.count(index)) {
-                    return false;  // Already being requested
+                    // Check if we should allow speculative request (stale original)
+                    auto ts_it = g_global_requested_indices_ts.find(index);
+                    if (ts_it == g_global_requested_indices_ts.end() ||
+                        (now_ms() - ts_it->second) < SPECULATIVE_REQUEST_DELAY_MS) {
+                        return false;  // Already being requested and not stale
+                    }
+                    // Stale - allow speculative request (don't insert again, just update ts)
                 }
                 g_global_requested_indices.insert(index);
+                g_global_requested_indices_ts[index] = now_ms();  // STALL FIX: Track request time
             }
 
             // Use hash-based request
@@ -4052,7 +4083,7 @@ bool P2P::request_block_index(PeerState& ps, uint64_t index){
             // Send failed - remove from tracking
             {
                 InflightLock lk(g_inflight_lock);
-                g_global_requested_indices.erase(index);
+                clear_global_requested_index(index);
             }
             return false;
         }
@@ -4985,7 +5016,7 @@ void P2P::handle_incoming_block(Sock sock, const std::vector<uint8_t>& raw){
                     idx_it->second.erase(block_height);
                 }
                 // Clear from global requested indices
-                g_global_requested_indices.erase(block_height);
+                clear_global_requested_index(block_height);
             }
         }
         g_rr_next_idx.erase(hexkey(bh));
