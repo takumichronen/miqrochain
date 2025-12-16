@@ -6603,6 +6603,14 @@ void P2P::loop(){
                                               const std::string key = hexkey(block_hash);
                                               itT->second.inflight_blocks.insert(key);
                                               g_global_inflight_blocks.insert(key);
+                                              // CRITICAL FIX: Re-add to index tracking!
+                                              // Otherwise fill_index_pipeline can't see this is being requested
+                                              {
+                                                  InflightLock lk(g_inflight_lock);
+                                                  g_global_requested_indices.insert(next_needed);
+                                              }
+                                              g_inflight_index_ts[target][next_needed] = tnow;
+                                              g_inflight_index_order[target].push_back(next_needed);
                                               sent = true;
                                           }
                                       }
@@ -6634,7 +6642,18 @@ void P2P::loop(){
                                   auto itT = peers_.find(try_peer);
                                   if (itT != peers_.end()) {
                                       auto msg = encode_msg("getb", block_hash);
-                                      send_or_close(try_peer, msg);
+                                      if (send_or_close(try_peer, msg)) {
+                                          const std::string key = hexkey(block_hash);
+                                          itT->second.inflight_blocks.insert(key);
+                                          g_global_inflight_blocks.insert(key);
+                                          // CRITICAL FIX: Track by index too
+                                          {
+                                              InflightLock lk(g_inflight_lock);
+                                              g_global_requested_indices.insert(next_needed);
+                                          }
+                                          g_inflight_index_ts[try_peer][next_needed] = tnow;
+                                          g_inflight_index_order[try_peer].push_back(next_needed);
+                                      }
                                       log_info("P2P: Gap retry " + std::to_string(next_needed) +
                                                " from peer " + itT->second.ip + " [hash-based]");
                                   }
@@ -6648,10 +6667,22 @@ void P2P::loop(){
                                            " - broadcasting to ALL peers (final attempt) [hash-based]");
 
                                   int sent_count = 0;
+                                  const std::string key = hexkey(block_hash);
                                   for (auto& kvp : peers_) {
                                       if (!kvp.second.verack_ok) continue;
                                       auto msg = encode_msg("getb", block_hash);
-                                      if (send_or_close(kvp.first, msg)) sent_count++;
+                                      if (send_or_close(kvp.first, msg)) {
+                                          kvp.second.inflight_blocks.insert(key);
+                                          g_global_inflight_blocks.insert(key);
+                                          // CRITICAL FIX: Track by index too (only for first peer)
+                                          if (sent_count == 0) {
+                                              InflightLock lk(g_inflight_lock);
+                                              g_global_requested_indices.insert(next_needed);
+                                              g_inflight_index_ts[kvp.first][next_needed] = tnow;
+                                              g_inflight_index_order[kvp.first].push_back(next_needed);
+                                          }
+                                          sent_count++;
+                                      }
                                   }
                                   log_info("P2P: Broadcast gap " + std::to_string(next_needed) +
                                            " to " + std::to_string(sent_count) + " peers [hash-based]");
