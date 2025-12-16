@@ -9403,6 +9403,11 @@ void P2P::loop(){
                             continue;
                         }
                         const size_t kHdrBatchMax = 2000; // must match build_headers_payload()
+
+                        // SYNC FIX: Track best_header_height BEFORE processing to detect real progress
+                        // accept_header() returns true for duplicates, which tricks progress detection
+                        uint64_t best_height_before = chain_.best_header_height();
+
                         size_t accepted = 0;
                         bool   used_reverse = false;
                         std::string herr;
@@ -9422,7 +9427,12 @@ void P2P::loop(){
                         }
                         if (used_reverse) { g_hdr_flip[s] = true; }
 
-                        if (hs.empty() || accepted == 0) {
+                        // SYNC FIX: Check if best_header actually advanced (not just accepted duplicates)
+                        uint64_t best_height_after = chain_.best_header_height();
+                        bool made_real_progress = (best_height_after > best_height_before);
+
+                        // Treat duplicate headers (no real progress) as zero progress for fallback logic
+                        if (hs.empty() || accepted == 0 || !made_real_progress) {
                             int &zero_count = g_zero_hdr_batches[s];
                             if (++zero_count >= MIQ_HEADERS_EMPTY_LIMIT) {
                                 zero_count = 0;
