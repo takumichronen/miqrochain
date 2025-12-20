@@ -8407,9 +8407,21 @@ void P2P::loop(){
                 // Track total bytes received for network stats
                 p2p_stats::bytes_recv.fetch_add((uint64_t)n, std::memory_order_relaxed);
 
-                // Log received bytes during handshake phase for diagnostics
+                // Log received bytes for diagnostics
                 if (!ps.verack_ok) {
                     log_info("P2P: received " + std::to_string(n) + " bytes from " + ps.ip + " (handshake in progress)");
+                } else {
+                    // SYNC DIAG: Track bytes received post-handshake
+                    static std::atomic<uint64_t> s_last_recv_log_ms{0};
+                    static std::atomic<uint64_t> s_bytes_since_log{0};
+                    s_bytes_since_log.fetch_add((uint64_t)n, std::memory_order_relaxed);
+                    uint64_t now = (uint64_t)now_ms();
+                    uint64_t last = s_last_recv_log_ms.load(std::memory_order_relaxed);
+                    if (now - last > 10000) {  // Log every 10 seconds
+                        uint64_t bytes = s_bytes_since_log.exchange(0, std::memory_order_relaxed);
+                        s_last_recv_log_ms.store(now, std::memory_order_relaxed);
+                        log_info("[SYNC-RX] Received " + std::to_string(bytes) + " bytes in last 10s from all peers");
+                    }
                 }
 
                 ps.last_ms = now_ms();
@@ -9338,22 +9350,35 @@ void P2P::loop(){
                         g_peer_last_request_ms[(Sock)ps.sock] = now_ms();
                         if (m.payload.size() == 32) {
                             std::string hash_hex = hexkey(m.payload);
-                            P2P_TRACE("DEBUG: getb request for hash " + hash_hex + " from " + ps.ip);
+                            log_info("[GETB-RX] Request for hash=" + hash_hex.substr(0, 16) + " from " + ps.ip);
 
                             Block b;
-                            if (chain_.get_block_by_hash(m.payload, b)) {
+                            bool found = chain_.get_block_by_hash(m.payload, b);
+
+                            // SYNC FIX: If block not found, try reversed hash (endianness compatibility)
+                            // Some peers may use different byte order for hashes
+                            if (!found) {
+                                std::vector<uint8_t> rev_payload = m.payload;
+                                std::reverse(rev_payload.begin(), rev_payload.end());
+                                found = chain_.get_block_by_hash(rev_payload, b);
+                                if (found) {
+                                    log_info("[GETB-RX] Found block with REVERSED hash=" + hash_hex.substr(0, 16));
+                                }
+                            }
+
+                            if (found) {
                                 auto raw = ser_block(b);
-                                P2P_TRACE("DEBUG: Found block by hash " + hash_hex + ", size=" + std::to_string(raw.size()) + " bytes");
+                                log_info("[GETB-TX] Sending block hash=" + hash_hex.substr(0, 16) + " size=" + std::to_string(raw.size()) + " to " + ps.ip);
                                 if (raw.size() <= MIQ_FALLBACK_MAX_MSG_SIZE) {
                                     send_block(s, raw);
                                 } else {
-                                    P2P_TRACE("DEBUG: Block " + hash_hex + " too large (" + std::to_string(raw.size()) + " > " + std::to_string(MIQ_FALLBACK_MAX_MSG_SIZE) + ")");
+                                    log_warn("[GETB-TX] Block too large: " + std::to_string(raw.size()) + " > " + std::to_string(MIQ_FALLBACK_MAX_MSG_SIZE));
                                 }
                             } else {
-                                P2P_TRACE("DEBUG: Block not found by hash " + hash_hex);
+                                log_warn("[GETB-RX] Block NOT FOUND hash=" + hash_hex.substr(0, 16) + " height=" + std::to_string(chain_.height()));
                             }
                         } else {
-                            P2P_TRACE("DEBUG: getb invalid payload size " + std::to_string(m.payload.size()) + " (expected 32)");
+                            log_warn("[GETB-RX] Invalid payload size " + std::to_string(m.payload.size()) + " (expected 32)");
                         }
                     }
                     else if (cmd == "getbi") {
