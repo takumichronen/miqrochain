@@ -9325,26 +9325,20 @@ void P2P::loop(){
                             continue;
                         }
 
-                        // STRICT: During IBD, NEVER serve blocks unless we're at tip
-                        // The old check "height < g_max_known_peer_tip" failed when both were 0
                         const uint64_t our_height = chain_.height();
-                        const uint64_t peer_tip = g_max_known_peer_tip.load();
-                        const uint64_t header_tip = chain_.best_header_height();
-                        const uint64_t target = std::max(peer_tip, header_tip);
 
-                        if (miq::is_ibd_mode()) {
-                            // In IBD mode, only serve if we're at or very close to target
-                            // This allows seeds to serve while not wasting resources during sync
-                            if (our_height == 0 || (target > 0 && our_height + 10 < target)) {
-                                static int64_t last_reject_log_ms = 0;
-                                if (now_ms() - last_reject_log_ms > 5000) {
-                                    last_reject_log_ms = now_ms();
-                                    log_info("P2P: IBD ISOLATION - Ignoring getb from " + ps.ip +
-                                             " (our_height=" + std::to_string(our_height) +
-                                             " target=" + std::to_string(target) + ")");
-                                }
-                                continue;
+                        // IBD SYNC FIX: Only skip serving if we have NO blocks at all
+                        // Previously this was too aggressive and prevented nodes from serving
+                        // each other during sync, causing a deadlock. Now we serve any blocks
+                        // we have, even during IBD.
+                        if (our_height == 0) {
+                            static int64_t last_reject_log_ms = 0;
+                            if (now_ms() - last_reject_log_ms > 5000) {
+                                last_reject_log_ms = now_ms();
+                                log_info("P2P: No blocks to serve - Ignoring getb from " + ps.ip +
+                                         " (our_height=0)");
                             }
+                            continue;
                         }
 
                         g_peer_last_request_ms[(Sock)ps.sock] = now_ms();
@@ -9390,23 +9384,20 @@ void P2P::loop(){
                             continue;
                         }
 
-                        // STRICT: During IBD, NEVER serve blocks unless we're at tip
+                        // IBD SYNC FIX: Only skip serving if we have NO blocks at all
+                        // Previously this was too aggressive and prevented nodes from serving
+                        // each other during sync, causing a deadlock. Now we serve any blocks
+                        // we have, even during IBD.
                         const uint64_t our_height = chain_.height();
-                        const uint64_t peer_tip = g_max_known_peer_tip.load();
-                        const uint64_t header_tip = chain_.best_header_height();
-                        const uint64_t target = std::max(peer_tip, header_tip);
 
-                        if (miq::is_ibd_mode()) {
-                            if (our_height == 0 || (target > 0 && our_height + 10 < target)) {
-                                static int64_t last_reject_log_ms = 0;
-                                if (now_ms() - last_reject_log_ms > 5000) {
-                                    last_reject_log_ms = now_ms();
-                                    log_info("P2P: IBD ISOLATION - Ignoring getbi from " + ps.ip +
-                                             " (our_height=" + std::to_string(our_height) +
-                                             " target=" + std::to_string(target) + ")");
-                                }
-                                continue;
+                        if (our_height == 0) {
+                            static int64_t last_reject_log_ms = 0;
+                            if (now_ms() - last_reject_log_ms > 5000) {
+                                last_reject_log_ms = now_ms();
+                                log_info("P2P: No blocks to serve - Ignoring getbi from " + ps.ip +
+                                         " (our_height=0)");
                             }
+                            continue;
                         }
 
                         g_peer_last_request_ms[(Sock)ps.sock] = now_ms();
