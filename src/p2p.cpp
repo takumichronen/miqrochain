@@ -1305,6 +1305,38 @@ static std::atomic<bool> g_headers_just_done{false};
 // Global max peer tip - updated whenever we learn of higher tips
 static std::atomic<uint64_t> g_max_known_peer_tip{0};
 
+// ANTI-MALICIOUS-TIP FIX: Track when we last made header progress
+// If we can't get headers beyond our current height for 60 seconds,
+// cap g_max_known_peer_tip to best_header_height (peers may be lying)
+static std::atomic<int64_t> g_last_header_progress_ms{0};
+static std::atomic<uint64_t> g_last_header_progress_height{0};
+constexpr int64_t HEADER_STALL_TIMEOUT_MS = 60000;  // 60 seconds
+
+// Call this whenever we receive new headers that extend our chain
+static void on_header_progress(uint64_t new_height) {
+    g_last_header_progress_height.store(new_height, std::memory_order_relaxed);
+    g_last_header_progress_ms.store(now_ms(), std::memory_order_relaxed);
+}
+
+// Call periodically to check if we're stuck and need to cap max_peer_tip
+static void check_header_stall_and_cap_target() {
+    int64_t last_progress = g_last_header_progress_ms.load(std::memory_order_relaxed);
+    if (last_progress == 0) return;  // Never started
+
+    uint64_t hdr_height = g_chain_ptr ? g_chain_ptr->best_header_height() : 0;
+    uint64_t max_peer = g_max_known_peer_tip.load(std::memory_order_relaxed);
+
+    // If max_peer_tip > our headers and we've been stuck for 60+ seconds
+    if (max_peer > hdr_height + 10 && (now_ms() - last_progress) > HEADER_STALL_TIMEOUT_MS) {
+        // Cap max_peer_tip to our validated header height
+        // This prevents malicious peers from keeping us stuck forever
+        miq::log_warn("P2P: ANTI-MALICIOUS-TIP: No header progress for 60s, capping target from " +
+                      std::to_string(max_peer) + " to " + std::to_string(hdr_height) +
+                      " (peers may be announcing invalid chain)");
+        g_max_known_peer_tip.store(hdr_height, std::memory_order_relaxed);
+    }
+}
+
 // FORCE-COMPLETION MODE: When we're ≤16 blocks from tip, enable aggressive completion
 // In this mode: allow duplicate requests, relax limits, ignore peer penalties
 static std::atomic<bool> g_force_completion_mode{false};
@@ -6336,6 +6368,10 @@ void P2P::loop(){
               const int64_t tnow = now_ms();
               if (tnow - last_diag_ms > 5000) {
                   last_diag_ms = tnow;
+
+                  // ANTI-MALICIOUS-TIP: Check if peers are lying about their height
+                  check_header_stall_and_cap_target();
+
                   const uint64_t ch = chain_.height();
                   const uint64_t hh = chain_.best_header_height();
                   const uint64_t mp = g_max_known_peer_tip.load();
@@ -8832,6 +8868,13 @@ void P2P::loop(){
                                     if (g_max_known_peer_tip.compare_exchange_weak(old_max, announced_height)) {
                                         log_info("P2P: New max peer tip discovered: " + std::to_string(announced_height));
                                         tip_increased = true;
+
+                                        // ANTI-MALICIOUS-TIP: Start timer when we learn of higher tip
+                                        // If we can't get headers to this height within 60s, assume peer is lying
+                                        uint64_t our_hdr = chain_.best_header_height();
+                                        if (g_last_header_progress_ms.load() == 0) {
+                                            on_header_progress(our_hdr);  // Start the timer
+                                        }
                                         break;
                                     }
                                 }
@@ -9114,6 +9157,10 @@ void P2P::loop(){
                             // This allows should_validate_signatures() to skip signatures for
                             // deeply buried blocks during IBD
                             miq::set_best_header_height(new_header_height);
+
+                            // ANTI-MALICIOUS-TIP: Track header progress for stall detection
+                            on_header_progress(new_header_height);
+
                             uint64_t old_max = g_max_known_peer_tip.load();
                             while (new_header_height > old_max) {
                                 if (g_max_known_peer_tip.compare_exchange_weak(old_max, new_header_height)) {
