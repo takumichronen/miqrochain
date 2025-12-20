@@ -597,19 +597,10 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
             }
             c = &ip->second;
         }
-        // Collect up to interval for difficulty window
-        window.clear();
-        window.reserve(MIQ_RETARGET_INTERVAL);
-        c = cur;
-        while (c && window.size() < MIQ_RETARGET_INTERVAL) {
-            window.emplace_back(c->time, c->bits);
-            auto ip = header_index_.find(hk(c->prev));
-            if (ip == header_index_.end()) {
-                if (c->prev == tip_.hash) window.emplace_back(tip_.time, tip_.bits);
-                break;
-            }
-            c = &ip->second;
-        }
+        // CRITICAL FIX: Use last_headers() for difficulty window to match mining behavior.
+        // Previously, walking backwards through header_index_ could produce a different window
+        // than mining uses, especially if the fallback added extra entries.
+        window = last_headers(MIQ_RETARGET_INTERVAL);
     } else {
         parent_height = tip_.height;
         recent = last_headers(11);
@@ -620,12 +611,7 @@ bool Chain::validate_header(const BlockHeader& h, std::string& err) const {
         }
     }
 
-    // --- FIX: ensure difficulty window is chronological oldest->newest ---
-    if (!window.empty()) {
-        if (window.size() >= 2 && window.front().first > window.back().first) {
-            std::reverse(window.begin(), window.end());
-        }
-    }
+    // Window from last_headers() is already in chronological order (oldest first)
 
     // MTP (median over branch recent)
     int64_t mtp = median_time_of(recent);
@@ -2206,46 +2192,23 @@ bool Chain::verify_block(const Block& b, std::string& err) const{
         if (raw.size() > MIQ_FALLBACK_MAX_TX_SIZE) { err="tx too large"; return false; }
     }
 
-    // Difficulty bits equality (ALWAYS on), computed on the parent header's branch window
+    // Difficulty bits equality (ALWAYS on), computed using last_headers() for consistency with mining.
+    // CRITICAL FIX: Always use last_headers() to match what mining uses when calculating difficulty.
+    // Previously, validation walked backwards through header_index_ which could produce a different
+    // window than mining (e.g., if the fallback added an extra entry, causing window size mismatch).
+    // This caused "bad bits" rejections at epoch boundaries after the third epoch.
     {
-        std::vector<std::pair<int64_t,uint32_t>> window;
-        window.reserve(MIQ_RETARGET_INTERVAL);
-
-        const HeaderMeta* cur = nullptr;
         auto itp = header_index_.find(hk(b.header.prev_hash));
-        if (itp != header_index_.end()) {
-            cur = &itp->second;
-            while (cur && window.size() < MIQ_RETARGET_INTERVAL) {
-                window.emplace_back(cur->time, cur->bits);
-                auto ip = header_index_.find(hk(cur->prev));
-                if (ip == header_index_.end()) {
-                    if (cur->prev == tip_.hash) {
-                        window.emplace_back(tip_.time, tip_.bits);
-                    }
-                    break;
-                }
-                cur = &ip->second;
-            }
-            if (!window.empty() && window.front().first > window.back().first) {
-                std::reverse(window.begin(), window.end());
-            }
-            uint64_t next_h = itp->second.height + 1;
-            uint32_t expected = miq::epoch_next_bits(
-                window, BLOCK_TIME_SECS, GENESIS_BITS,
-                /*next_height=*/ next_h,
-                /*interval=*/ MIQ_RETARGET_INTERVAL
-            );
-            if (b.header.bits != expected) { err = "bad bits"; return false; }
-        } else {
-            // Conservative fallback (shouldn't happen since prev==tip): use last_headers()
-            auto last = last_headers(MIQ_RETARGET_INTERVAL);
-            uint32_t expected = miq::epoch_next_bits(
-                last, BLOCK_TIME_SECS, GENESIS_BITS,
-                /*next_height=*/ tip_.height + 1,
-                /*interval=*/ MIQ_RETARGET_INTERVAL
-            );
-            if (b.header.bits != expected) { err = "bad bits"; return false; }
-        }
+        uint64_t next_h = (itp != header_index_.end()) ? itp->second.height + 1 : tip_.height + 1;
+
+        // Use last_headers() - the same function mining uses - to ensure identical window calculation
+        auto window = last_headers(MIQ_RETARGET_INTERVAL);
+        uint32_t expected = miq::epoch_next_bits(
+            window, BLOCK_TIME_SECS, GENESIS_BITS,
+            /*next_height=*/ next_h,
+            /*interval=*/ MIQ_RETARGET_INTERVAL
+        );
+        if (b.header.bits != expected) { err = "bad bits"; return false; }
     }
 
     // POW - use cached block_hash instead of recomputing
