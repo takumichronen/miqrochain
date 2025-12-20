@@ -4181,12 +4181,15 @@ bool P2P::request_block_index(PeerState& ps, uint64_t index){
 
             // Use hash-based request
             auto msg = encode_msg("getb", block_hash);
+            log_info("[BLOCK-REQ] idx=" + std::to_string(index) + " hash=" + key.substr(0, 16) +
+                    " from " + ps.ip + " (hash-based)");
             if (send_or_close(ps.sock, msg)) {
                 ps.inflight_blocks.insert(key);
                 g_global_inflight_blocks.insert(key);
                 P2P_TRACE("TX " + ps.ip + " getb (hash-based) for index " + std::to_string(index));
                 return true;
             }
+            log_warn("[BLOCK-REQ] SEND FAILED idx=" + std::to_string(index) + " to " + ps.ip);
             // Send failed - remove from tracking
             {
                 InflightLock lk(g_inflight_lock);
@@ -4266,6 +4269,11 @@ void P2P::request_block_hash(PeerState& ps, const std::vector<uint8_t>& h){
     }
 
     auto msg = encode_msg("getb", h);
+    // DIAG: Log block request with height info
+    int64_t req_height = chain_.get_header_height(h);
+    log_info("[BLOCK-REQ] Requesting block hash=" + key.substr(0, 16) + " height=" +
+            std::to_string(req_height >= 0 ? req_height : -1) + " from " + ps.ip);
+
     if (send_or_close(ps.sock, msg)) {
         ps.inflight_blocks.insert(key);
         mark_block_inflight(key, (Sock)ps.sock);
@@ -4565,9 +4573,18 @@ void P2P::remove_orphan_by_hex(const std::string& child_hex){
 void P2P::queue_block_by_height(uint64_t height, const std::vector<uint8_t>& hash,
                                  const std::vector<uint8_t>& raw) {
     // Don't queue if we already have it
-    if (pending_blocks_.count(height)) return;
+    if (pending_blocks_.count(height)) {
+        log_info("[BLOCK-QUEUE] Block height=" + std::to_string(height) +
+                " hash=" + hexkey(hash).substr(0, 16) + " already queued - skipping");
+        return;
+    }
 
     g_diag_blocks_received++;
+
+    log_info("[BLOCK-QUEUE] Queued block height=" + std::to_string(height) +
+            " hash=" + hexkey(hash).substr(0, 16) +
+            " chain_height=" + std::to_string(chain_.height()) +
+            " pending=" + std::to_string(pending_blocks_.size()));
 
     PendingBlock pb;
     pb.hash = hash;
@@ -4801,9 +4818,12 @@ void P2P::process_pending_blocks() {
         std::string err;
         uint64_t new_height = 0;
         // RACE FIX: Capture height atomically during submit (under chain lock)
+        log_info("[BLOCK-SUBMIT] Submitting block height=" + std::to_string(next_height) +
+                " hash=" + hexkey(b.block_hash()).substr(0, 16));
         bool accepted = chain_.submit_block(b, err, &new_height);
 
         if (accepted) {
+            log_info("[BLOCK-SUBMIT] SUCCESS height=" + std::to_string(new_height));
             blocks_processed++;
             g_diag_blocks_processed++;
 
@@ -4890,8 +4910,9 @@ void P2P::process_pending_blocks() {
             next_height = current_height + 1;
         } else {
             // Block rejected - log and remove
-            log_warn("P2P: pending block at height " + std::to_string(next_height) +
-                     " rejected: " + err);
+            log_warn("[BLOCK-SUBMIT] REJECTED height=" + std::to_string(next_height) +
+                     " hash=" + hexkey(b.block_hash()).substr(0, 16) +
+                     " error=\"" + err + "\"");
             pending_blocks_bytes_ -= it->second.raw.size();
             pending_blocks_.erase(it);
 
@@ -9527,7 +9548,12 @@ void P2P::loop(){
 
                     } else if (cmd == "block") {
                         g_peer_last_fetch_ms[(Sock)ps.sock] = now_ms();
+
+                        // DIAG: Log every block message received
+                        log_info("[BLOCK-RX] Received block message from " + ps.ip + " size=" + std::to_string(m.payload.size()));
+
                         if (!rate_consume_block(ps, m.payload.size())) {
+                            log_warn("[BLOCK-RX] DROPPED: rate limit exceeded from " + ps.ip);
                             if (!ibd_or_fetch_active(ps, now_ms())) {
                                 if ((ps.banscore += 5) >= MIQ_P2P_MAX_BANSCORE) bump_ban(ps, ps.ip, "block-rate", now_ms());
                             }
@@ -9535,16 +9561,33 @@ void P2P::loop(){
                         }
                         if (m.payload.size() > 0 && m.payload.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) {
                             Block hb;
-                            if (!deser_block(m.payload, hb)) { if (++ps.mis > 10) { dead.push_back(s); } continue; }
+                            if (!deser_block(m.payload, hb)) {
+                                log_warn("[BLOCK-RX] DROPPED: deser_block failed from " + ps.ip);
+                                if (++ps.mis > 10) { dead.push_back(s); }
+                                continue;
+                            }
 
                             const std::string bh = hexkey(hb.block_hash());
+                            int64_t rx_parent_height = chain_.get_header_height(hb.header.prev_hash);
+                            uint64_t rx_block_height = (rx_parent_height >= 0) ? (uint64_t)(rx_parent_height + 1) : 0;
+
+                            log_info("[BLOCK-RX] Block hash=" + bh.substr(0, 16) + " height=" +
+                                    std::to_string(rx_block_height) + " from " + ps.ip +
+                                    " inflight=" + std::to_string(ps.inflight_blocks.count(bh) ? 1 : 0));
+
                             bool drop_unsolicited = false;
                             if (!ps.syncing) {
                                 // During headers phase we prefer liveness: take orphan and chase parent.
                                 const bool in_headers_phase = !g_logged_headers_done;
                                 bool parent_known = chain_.header_exists(hb.header.prev_hash) || chain_.have_block(hb.header.prev_hash);
                                 if (!parent_known && !in_headers_phase) {
-                                    if (unsolicited_drop(ps, "block", bh)) drop_unsolicited = true;
+                                    if (unsolicited_drop(ps, "block", bh)) {
+                                        log_warn("[BLOCK-RX] DROPPED as unsolicited: " + bh.substr(0, 16) +
+                                                " height=" + std::to_string(rx_block_height) + " from " + ps.ip +
+                                                " (syncing=" + std::to_string(ps.syncing) +
+                                                " parent_known=" + std::to_string(parent_known) + ")");
+                                        drop_unsolicited = true;
+                                    }
                                 }
                             }
                             if (drop_unsolicited) {
