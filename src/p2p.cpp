@@ -1638,7 +1638,8 @@ static inline void clear_all_inflight_for_sock(Sock sock) {
     auto idx_it = g_inflight_index_ts.find(sock);
     if (idx_it != g_inflight_index_ts.end()) {
         for (const auto& kv : idx_it->second) {
-            g_global_requested_indices.erase(kv.first);
+            // Use helper to clear both the set AND the timestamp map
+            clear_global_requested_index(kv.first);
         }
     }
     g_inflight_index_ts.erase(sock);
@@ -8904,6 +8905,45 @@ void P2P::loop(){
 #endif
                         ps.whitelisted = is_loopback(ps.ip) || is_whitelisted_ip(ps.ip);
                         try_finish_handshake();
+
+                        // ================================================================
+                        // LATE VERACK HANDLING
+                        // If handshake was already completed in compatibility mode (without
+                        // verack), but we now received verack, upgrade the peer to sync-capable.
+                        // This fixes sync stalls caused by peers that send verack after version.
+                        // ================================================================
+                        if (ps.verack_ok && !ps.received_verack) {
+                            log_info("P2P: Late verack received from " + ps.ip + " - upgrading to sync-capable");
+                            ps.received_verack = true;
+
+                            // Only start sync if not already syncing and not pending fork verification
+                            if (!ps.syncing && !ps.fork_verification_pending && !ps.fork_detected) {
+                                const uint64_t our_height = chain_.height();
+
+                                // Check if we need fork verification (have checkpoint blocks)
+                                const auto& checkpoints = miq::get_checkpoints();
+                                bool need_fork_verify = false;
+                                for (auto it = checkpoints.rbegin(); it != checkpoints.rend(); ++it) {
+                                    if (it->height > 0 && it->height <= our_height) {
+                                        need_fork_verify = true;
+                                        break;
+                                    }
+                                }
+
+                                if (!need_fork_verify) {
+                                    // No checkpoints yet - start sync immediately
+                                    ps.fork_verified = true;
+                                    g_peer_index_capable[(Sock)s] = true;
+                                    ps.syncing = true;
+                                    ps.next_index = our_height + 1;
+                                    fill_index_pipeline(ps);
+                                    log_info("P2P: Starting sync with " + ps.ip + " after late verack (no checkpoint verification needed)");
+                                } else {
+                                    // Need to verify fork first - trigger verification if not already pending
+                                    log_info("P2P: Peer " + ps.ip + " now sync-capable after late verack, but fork verification required");
+                                }
+                            }
+                        }
 
                     // ================================================================
                     // HANDSHAKE FIREWALL (Bitcoin Core-aligned)
