@@ -9462,27 +9462,28 @@ void P2P::loop(){
                             continue;
                         }
 
-                        // STRICT: During IBD, NEVER serve blocks unless we're at tip
-                        // The old check "height < g_max_known_peer_tip" failed when both were 0
                         const uint64_t our_height = chain_.height();
-                        const uint64_t peer_tip = g_max_known_peer_tip.load();
-                        const uint64_t header_tip = chain_.best_header_height();
-                        const uint64_t target = std::max(peer_tip, header_tip);
 
-                        if (miq::is_ibd_mode()) {
-                            // In IBD mode, only serve if we're at or very close to target
-                            // This allows seeds to serve while not wasting resources during sync
-                            if (our_height == 0 || (target > 0 && our_height + 10 < target)) {
-                                static int64_t last_reject_log_ms = 0;
-                                if (now_ms() - last_reject_log_ms > 5000) {
-                                    last_reject_log_ms = now_ms();
-                                    log_info("P2P: IBD ISOLATION - Ignoring getb from " + ps.ip +
-                                             " (our_height=" + std::to_string(our_height) +
-                                             " target=" + std::to_string(target) + ")");
-                                }
-                                continue;
+                        // CRITICAL FIX: Only apply IBD isolation if we have NO blocks to serve
+                        // The original code rejected ALL requests during IBD, even from nodes
+                        // that needed blocks we have. This caused mutual deadlock when both
+                        // nodes were in IBD mode - neither would serve blocks to the other!
+                        //
+                        // New logic: If we have blocks (our_height > 0), ALWAYS serve them.
+                        // The purpose of a blockchain is to share blocks!
+                        if (miq::is_ibd_mode() && our_height == 0) {
+                            // We're syncing and have no blocks - nothing to serve anyway
+                            // Skip serving to focus resources on downloading
+                            static int64_t last_reject_log_ms = 0;
+                            if (now_ms() - last_reject_log_ms > 5000) {
+                                last_reject_log_ms = now_ms();
+                                log_info("P2P: IBD - Cannot serve getb from " + ps.ip +
+                                         " (we have no blocks yet)");
                             }
+                            continue;
                         }
+                        // If we have blocks (our_height > 0), fall through and serve them
+                        // regardless of IBD state
 
                         g_peer_last_request_ms[(Sock)ps.sock] = now_ms();
                         if (m.payload.size() == 32) {
@@ -9506,31 +9507,23 @@ void P2P::loop(){
                         }
                     }
                     else if (cmd == "getbi") {
-                        // ================================================================
-                        // STRICT IBD ISOLATION: Never serve blocks during IBD
-                        // ================================================================
                         if (!ps.verack_ok) {
                             P2P_TRACE("DEBUG: Ignoring getbi from " + ps.ip + " - handshake not complete");
                             continue;
                         }
 
-                        // STRICT: During IBD, NEVER serve blocks unless we're at tip
                         const uint64_t our_height = chain_.height();
-                        const uint64_t peer_tip = g_max_known_peer_tip.load();
-                        const uint64_t header_tip = chain_.best_header_height();
-                        const uint64_t target = std::max(peer_tip, header_tip);
 
-                        if (miq::is_ibd_mode()) {
-                            if (our_height == 0 || (target > 0 && our_height + 10 < target)) {
-                                static int64_t last_reject_log_ms = 0;
-                                if (now_ms() - last_reject_log_ms > 5000) {
-                                    last_reject_log_ms = now_ms();
-                                    log_info("P2P: IBD ISOLATION - Ignoring getbi from " + ps.ip +
-                                             " (our_height=" + std::to_string(our_height) +
-                                             " target=" + std::to_string(target) + ")");
-                                }
-                                continue;
+                        // CRITICAL FIX: Same as getb - only isolate if we have no blocks
+                        // If we have blocks, ALWAYS serve them regardless of IBD state.
+                        if (miq::is_ibd_mode() && our_height == 0) {
+                            static int64_t last_reject_log_ms = 0;
+                            if (now_ms() - last_reject_log_ms > 5000) {
+                                last_reject_log_ms = now_ms();
+                                log_info("P2P: IBD - Cannot serve getbi from " + ps.ip +
+                                         " (we have no blocks yet)");
                             }
+                            continue;
                         }
 
                         g_peer_last_request_ms[(Sock)ps.sock] = now_ms();
