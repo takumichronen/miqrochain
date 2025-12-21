@@ -1469,61 +1469,58 @@ bool Chain::open(const std::string& dir){
         }
     }
 
+    // ==========================================================================
     // CRITICAL FIX: Auto-detect and rebuild corrupted UTXO set
-    // This fixes "missing utxo" errors that occur when blocks are stored but UTXOs weren't applied
+    // ==========================================================================
+    // This fixes the "25 UTXOs but 7884 blocks" problem where UTXOs weren't
+    // flushed to disk during fast sync. The txindex is correct, so we rebuild
+    // from the blockchain.
+    // ==========================================================================
     if (tip_.height > 0) {
+        size_t utxo_count = utxo_.size();
+        size_t block_count = tip_.height + 1;
+
+        log_info("========================================");
+        log_info("UTXO INTEGRITY CHECK");
+        log_info("UTXO count: " + std::to_string(utxo_count));
+        log_info("Block count: " + std::to_string(block_count));
+        log_info("========================================");
+
         bool needs_utxo_rebuild = false;
 
-        // Check 1: If UTXO set is completely empty but we have blocks, definitely corrupted
-        if (utxo_.size() == 0) {
-            log_warn("UTXO set is empty but chain has " + std::to_string(tip_.height + 1) +
-                     " blocks - triggering automatic rebuild");
+        // AGGRESSIVE CHECK: If < 100 UTXOs and > 1000 blocks, ALWAYS rebuild
+        // This catches the "25 UTXOs but 7884 blocks" case
+        if (utxo_count < 100 && block_count > 1000) {
+            log_warn("CRITICAL: Only " + std::to_string(utxo_count) + " UTXOs for " +
+                     std::to_string(block_count) + " blocks - FORCING REBUILD!");
             needs_utxo_rebuild = true;
         }
 
-        // Check 2: UTXO count is suspiciously low (should have at least 1 UTXO per block on average)
-        // A healthy chain should have many more UTXOs than blocks due to transaction outputs
-        // If we have way fewer, something is wrong
-        if (!needs_utxo_rebuild && utxo_.size() < tip_.height / 10 && tip_.height > 100) {
-            log_warn("UTXO count (" + std::to_string(utxo_.size()) + ") is suspiciously low for " +
-                     std::to_string(tip_.height + 1) + " blocks - triggering automatic rebuild");
+        // Check: UTXO count < 10% of blocks is wrong
+        if (!needs_utxo_rebuild && utxo_count < block_count / 10 && block_count > 100) {
+            log_warn("UTXO count too low - triggering rebuild from blockchain");
             needs_utxo_rebuild = true;
-        }
-
-        // Check 3: Verify early coinbase UTXOs exist (most reliable corruption detection)
-        // Block 1's coinbase should always exist unless spent - try to verify chain integrity
-        if (!needs_utxo_rebuild && tip_.height >= 1) {
-            Block blk1;
-            if (get_block_by_index(1, blk1) && !blk1.txs.empty()) {
-                auto cb_txid = blk1.txs[0].txid();
-                UTXOEntry dummy;
-                // Check if block 1's coinbase output 0 exists (or was spent)
-                // For a simple check, we verify the UTXO lookup doesn't crash
-                // A more thorough check would trace spending history
-                bool found = utxo_.get(cb_txid, 0, dummy);
-                // If not found, it might have been spent - that's OK
-                // But if UTXO count is very low AND this is missing, likely corruption
-                if (!found && utxo_.size() < tip_.height) {
-                    // Double-check by verifying block 0's coinbase
-                    Block blk0;
-                    if (get_block_by_index(0, blk0) && !blk0.txs.empty()) {
-                        auto cb0_txid = blk0.txs[0].txid();
-                        if (!utxo_.get(cb0_txid, 0, dummy) && utxo_.size() < 100) {
-                            log_warn("Critical UTXOs appear missing - triggering automatic rebuild");
-                            needs_utxo_rebuild = true;
-                        }
-                    }
-                }
-            }
         }
 
         if (needs_utxo_rebuild) {
-            log_info("=== AUTOMATIC UTXO REBUILD TRIGGERED ===");
+            log_info("=======================================================");
+            log_info("=== REBUILDING UTXO SET FROM BLOCKCHAIN ===");
+            log_info("=======================================================");
+            log_info("Your wallet balance will be recalculated from all transactions.");
+            log_info("This may take a few minutes - DO NOT INTERRUPT!");
+
             if (rebuild_utxo_from_blocks()) {
+                log_info("=======================================================");
                 log_info("=== UTXO REBUILD COMPLETE ===");
+                log_info("New UTXO count: " + std::to_string(utxo_.size()));
+                log_info("Wallet balance should now be correct!");
+                log_info("=======================================================");
             } else {
-                log_error("UTXO rebuild failed! Chain may be in inconsistent state.");
+                log_error("UTXO rebuild FAILED!");
+                log_error("Please delete utxo.log and restart the node.");
             }
+        } else {
+            log_info("UTXO set OK (" + std::to_string(utxo_count) + " UTXOs)");
         }
     }
 
@@ -1754,6 +1751,18 @@ bool Chain::rebuild_utxo_from_blocks() {
     }
 
     log_info("UTXO rebuild complete: processed " + std::to_string(chain_height + 1) + " blocks");
+
+    // CRITICAL FIX: Flush UTXO set to disk after rebuild!
+    // During rebuild, utxo_.add() skips log writes if fast_sync_enabled().
+    // Without this flush, the rebuilt UTXOs exist in memory but aren't persisted.
+    // On next restart, they'd be lost again - defeating the purpose of rebuild!
+    log_info("Flushing rebuilt UTXO set to disk (" + std::to_string(utxo_.size()) + " UTXOs)...");
+    if (!utxo_.flush_to_disk()) {
+        log_error("UTXO flush to disk FAILED after rebuild!");
+        return false;
+    }
+    log_info("UTXO flush complete - wallet balance should now be correct");
+
     return true;
 }
 
@@ -1870,9 +1879,32 @@ bool Chain::load_state(){
 void Chain::rebuild_header_index_from_blocks(){
     MIQ_CHAIN_GUARD();
 
-    // Only rebuild if header index is empty but we have blocks
-    if (!header_index_.empty() || tip_.height == 0) {
+    // CRITICAL FIX: Also rebuild if header index exists but is behind tip_
+    // This handles the case where blocks.dat has more blocks than header index
+    // Without this fix, best_header_height() would return stale value
+    uint64_t current_best_header_height = 0;
+    if (!best_header_key_.empty()) {
+        auto it = header_index_.find(best_header_key_);
+        if (it != header_index_.end()) {
+            current_best_header_height = it->second.height;
+        }
+    }
+
+    // Skip rebuild if:
+    // - No blocks to process (tip_.height == 0)
+    // - Header index is in sync with tip (current_best_header_height >= tip_.height)
+    if (tip_.height == 0) {
         return;
+    }
+
+    // Only log and rebuild if we're behind
+    if (!header_index_.empty() && current_best_header_height >= tip_.height) {
+        return;  // Header index is up to date
+    }
+
+    if (!header_index_.empty() && current_best_header_height < tip_.height) {
+        log_info("Header index is behind tip (headers=" + std::to_string(current_best_header_height) +
+                 " tip=" + std::to_string(tip_.height) + ") - rebuilding missing entries...");
     }
 
     // Count actual blocks in storage (handle gaps)
@@ -2533,6 +2565,15 @@ bool Chain::disconnect_tip_once(std::string& err){
     tip_.time   = prev.header.time;
     tip_.issued -= cb_sum;
     tip_.work_sum -= work_from_bits(cur.header.bits);  // PERF: Update cached work
+
+    // CRITICAL FIX: Reset best_header_key_ to the new tip after block disconnect
+    // Without this, best_header_height() returns the old (higher) disconnected header height
+    // which causes compute_sync_gate() to fail with "syncing (cur/old_higher)" forever.
+    // This was causing "Finalizing..." stuck state after deleting malicious blocks.
+    best_header_key_ = hk(tip_.hash);
+
+    // Also reset the global atomic header height used by P2P and assume-valid
+    miq::reset_best_header_height(tip_.height);
 
     {
         std::lock_guard<std::mutex> lk(g_undo_mtx);

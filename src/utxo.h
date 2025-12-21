@@ -24,6 +24,10 @@ public:
     size_t size() const { return map_.size(); }
     void clear();  // Clear UTXO set and log for rebuild
 
+    // CRITICAL FIX: Flush entire in-memory map to disk
+    // Must be called after IBD completes to persist UTXOs that were skipped during fast sync
+    bool flush_to_disk();
+
     // Enumerate live UTXOs for a given PKH. Returns (txid, vout, entry).
     std::vector<std::tuple<std::vector<uint8_t>, uint32_t, UTXOEntry>>
     list_for_pkh(const std::vector<uint8_t>& pkh) const;
