@@ -1437,22 +1437,7 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
     }
 
     // ========================================================================
-    // RULE 3: Tip must not be too old (prevents stale chain)
-    // Allow 15 minutes for slow networks, but not hours old
-    // ========================================================================
-    auto tip = chain.tip();
-    uint64_t tip_time = hdr_time(tip);
-    uint64_t now_time = (uint64_t)std::time(nullptr);
-    uint64_t tip_age = (now_time > tip_time) ? (now_time - tip_time) : 0;
-
-    // If we have blocks but tip is ancient, something is wrong
-    if (block_height > 0 && tip_age > 15 * 60) {  // 15 minutes
-        why_out = "tip too old (" + std::to_string(tip_age / 60) + "m)";
-        return false;
-    }
-
-    // ========================================================================
-    // RULE 4: Check peer-reported heights (if available)
+    // RULE 3: Check peer-reported heights FIRST (if available)
     // We should be at or above the highest reported peer tip
     // ========================================================================
     uint64_t max_peer_tip = 0;
@@ -1465,6 +1450,30 @@ static bool compute_sync_gate(Chain& chain, P2P* p2p, std::string& why_out) {
     if (max_peer_tip > 0 && block_height < max_peer_tip) {
         why_out = "syncing (" + std::to_string(block_height) + "/" + std::to_string(max_peer_tip) + ")";
         return false;
+    }
+
+    // ========================================================================
+    // RULE 4: Tip must not be too old (prevents stale chain)
+    // CRITICAL FIX: Only apply this check if we're BEHIND the network.
+    // If we're at or above max_peer_tip, we're synced regardless of tip age.
+    // This fixes the "Finalizing..." stuck state after rebuilding from blocks.dat
+    // where tip block has an old timestamp but we're fully synced.
+    // ========================================================================
+    auto tip = chain.tip();
+    uint64_t tip_time = hdr_time(tip);
+    uint64_t now_time = (uint64_t)std::time(nullptr);
+    uint64_t tip_age = (now_time > tip_time) ? (now_time - tip_time) : 0;
+
+    // Only check tip age if we're at the network tip (max_peer_tip == 0 or we matched it)
+    // If peers report a tip and we're at that tip, we're synced even if tip is old
+    // (The network hasn't produced new blocks in a while, which is fine)
+    if (max_peer_tip == 0 && block_height > 0 && tip_age > 15 * 60) {
+        // No peer tips available and our tip is old - might be stale
+        // But allow if we at least match the header height
+        if (block_height < header_height) {
+            why_out = "tip too old (" + std::to_string(tip_age / 60) + "m)";
+            return false;
+        }
     }
 
     // ========================================================================

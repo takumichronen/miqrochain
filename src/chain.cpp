@@ -1884,9 +1884,32 @@ bool Chain::load_state(){
 void Chain::rebuild_header_index_from_blocks(){
     MIQ_CHAIN_GUARD();
 
-    // Only rebuild if header index is empty but we have blocks
-    if (!header_index_.empty() || tip_.height == 0) {
+    // CRITICAL FIX: Also rebuild if header index exists but is behind tip_
+    // This handles the case where blocks.dat has more blocks than header index
+    // Without this fix, best_header_height() would return stale value
+    uint64_t current_best_header_height = 0;
+    if (!best_header_key_.empty()) {
+        auto it = header_index_.find(best_header_key_);
+        if (it != header_index_.end()) {
+            current_best_header_height = it->second.height;
+        }
+    }
+
+    // Skip rebuild if:
+    // - No blocks to process (tip_.height == 0)
+    // - Header index is in sync with tip (current_best_header_height >= tip_.height)
+    if (tip_.height == 0) {
         return;
+    }
+
+    // Only log and rebuild if we're behind
+    if (!header_index_.empty() && current_best_header_height >= tip_.height) {
+        return;  // Header index is up to date
+    }
+
+    if (!header_index_.empty() && current_best_header_height < tip_.height) {
+        log_info("Header index is behind tip (headers=" + std::to_string(current_best_header_height) +
+                 " tip=" + std::to_string(tip_.height) + ") - rebuilding missing entries...");
     }
 
     // Count actual blocks in storage (handle gaps)
