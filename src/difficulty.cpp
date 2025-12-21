@@ -7,6 +7,10 @@
 #include <utility>
 #include <cstring>
 
+#if defined(_MSC_VER)
+#include <intrin.h>      // For _umul128, _udiv128 on Windows
+#endif
+
 namespace miq {
 
 // Convert big-endian 32-byte target -> compact "bits"
@@ -52,6 +56,71 @@ static inline void target_from_compact(uint32_t bits, unsigned char* out) {
 // 256-bit arithmetic for proper difficulty scaling
 // ============================================================================
 
+// Portable 64x64->128 multiplication (works on MSVC and GCC/Clang)
+static inline void mul64(uint64_t a, uint64_t b, uint64_t& hi, uint64_t& lo) {
+#if defined(_MSC_VER) && defined(_M_X64)
+    lo = _umul128(a, b, &hi);
+#elif defined(__SIZEOF_INT128__)
+    __uint128_t r = (__uint128_t)a * b;
+    lo = (uint64_t)r;
+    hi = (uint64_t)(r >> 64);
+#else
+    // Portable fallback: split into 32-bit parts
+    uint64_t a_lo = (uint32_t)a;
+    uint64_t a_hi = a >> 32;
+    uint64_t b_lo = (uint32_t)b;
+    uint64_t b_hi = b >> 32;
+
+    uint64_t p0 = a_lo * b_lo;
+    uint64_t p1 = a_lo * b_hi;
+    uint64_t p2 = a_hi * b_lo;
+    uint64_t p3 = a_hi * b_hi;
+
+    uint64_t mid = p1 + (p0 >> 32);
+    mid += p2;
+    if (mid < p2) p3 += (1ULL << 32);  // carry
+
+    lo = (p0 & 0xFFFFFFFF) | (mid << 32);
+    hi = p3 + (mid >> 32);
+#endif
+}
+
+// Portable 128/64->64 division with remainder
+static inline uint64_t div128by64(uint64_t hi, uint64_t lo, uint64_t divisor, uint64_t& remainder) {
+#if defined(_MSC_VER) && defined(_M_X64)
+    return _udiv128(hi, lo, divisor, &remainder);
+#elif defined(__SIZEOF_INT128__)
+    __uint128_t n = ((__uint128_t)hi << 64) | lo;
+    remainder = (uint64_t)(n % divisor);
+    return (uint64_t)(n / divisor);
+#else
+    // Portable fallback using binary long division
+    if (hi == 0) {
+        remainder = lo % divisor;
+        return lo / divisor;
+    }
+
+    // Full 128-bit division needed
+    uint64_t quotient = 0;
+    uint64_t rem = 0;
+
+    for (int i = 127; i >= 0; --i) {
+        rem <<= 1;
+        if (i >= 64) {
+            rem |= (hi >> (i - 64)) & 1;
+        } else {
+            rem |= (lo >> i) & 1;
+        }
+        if (rem >= divisor) {
+            rem -= divisor;
+            if (i < 64) quotient |= (1ULL << i);
+        }
+    }
+    remainder = rem;
+    return quotient;
+#endif
+}
+
 // Multiply 256-bit target (big-endian) by numerator, divide by denominator
 // Uses proper carry propagation to avoid truncation bugs
 static void scale_target_256(unsigned char* t, uint64_t num, uint64_t denom) {
@@ -70,21 +139,27 @@ static void scale_target_256(unsigned char* t, uint64_t num, uint64_t denom) {
 
     // Multiply by num: result is 320-bit (5 words) to handle overflow
     // We multiply each word by num, propagate carry
-    __uint128_t carry = 0;
+    uint64_t carry_hi = 0, carry_lo = 0;
     uint64_t result[5] = {0, 0, 0, 0, 0};
     for (int w = 0; w < 4; ++w) {
-        __uint128_t prod = (__uint128_t)words[w] * num + carry;
-        result[w] = (uint64_t)prod;
-        carry = prod >> 64;
+        uint64_t prod_hi, prod_lo;
+        mul64(words[w], num, prod_hi, prod_lo);
+
+        // Add carry from previous iteration
+        prod_lo += carry_lo;
+        if (prod_lo < carry_lo) prod_hi++;  // overflow
+        prod_hi += carry_hi;
+
+        result[w] = prod_lo;
+        carry_lo = prod_hi;
+        carry_hi = 0;
     }
-    result[4] = (uint64_t)carry;
+    result[4] = carry_lo;
 
     // Divide by denom: long division from most significant word down
     uint64_t remainder = 0;
     for (int w = 4; w >= 0; --w) {
-        __uint128_t div_in = ((__uint128_t)remainder << 64) | result[w];
-        result[w] = (uint64_t)(div_in / denom);
-        remainder = (uint64_t)(div_in % denom);
+        result[w] = div128by64(remainder, result[w], denom, remainder);
     }
 
     // Check if result overflows 256 bits (words[4] != 0)
