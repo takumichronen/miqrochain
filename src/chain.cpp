@@ -1754,6 +1754,18 @@ bool Chain::rebuild_utxo_from_blocks() {
     }
 
     log_info("UTXO rebuild complete: processed " + std::to_string(chain_height + 1) + " blocks");
+
+    // CRITICAL FIX: Flush UTXO set to disk after rebuild!
+    // During rebuild, utxo_.add() skips log writes if fast_sync_enabled().
+    // Without this flush, the rebuilt UTXOs exist in memory but aren't persisted.
+    // On next restart, they'd be lost again - defeating the purpose of rebuild!
+    log_info("Flushing rebuilt UTXO set to disk (" + std::to_string(utxo_.size()) + " UTXOs)...");
+    if (!utxo_.flush_to_disk()) {
+        log_error("UTXO flush to disk FAILED after rebuild!");
+        return false;
+    }
+    log_info("UTXO flush complete - wallet balance should now be correct");
+
     return true;
 }
 

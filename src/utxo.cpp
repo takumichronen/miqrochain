@@ -241,5 +241,70 @@ void UTXOSet::clear() {
     f.close();
 }
 
+// CRITICAL FIX: Flush entire in-memory UTXO map to disk
+// This MUST be called after IBD completes because append_log() skips writes during fast sync.
+// Without this, UTXOs are lost on restart!
+bool UTXOSet::flush_to_disk() {
+    std::lock_guard<std::mutex> lk(mtx_);
+
+    if (map_.empty()) return true;  // Nothing to flush
+
+    // Truncate and rewrite the entire log file with current state
+    std::ofstream f(log_path_, std::ios::trunc | std::ios::binary);
+    if (!f) return false;
+
+    size_t count = 0;
+    for (const auto& kv : map_) {
+        // Parse key format: "hex_txid:vout"
+        const std::string& k = kv.first;
+        size_t colon = k.rfind(':');
+        if (colon == std::string::npos) continue;
+
+        std::vector<uint8_t> txid = from_hex(k.substr(0, colon));
+        uint32_t vout = static_cast<uint32_t>(std::stoul(k.substr(colon + 1)));
+        const UTXOEntry& e = kv.second;
+
+        // Write 'A' (add) operation
+        char op = 'A';
+        f.write(&op, 1);
+
+        uint32_t n = (uint32_t)txid.size();
+        f.write((const char*)&n, sizeof(n));
+        f.write((const char*)txid.data(), n);
+        f.write((const char*)&vout, sizeof(vout));
+
+        f.write((const char*)&e.value, sizeof(e.value));
+        f.write((const char*)&e.height, sizeof(e.height));
+        char cb = e.coinbase ? 1 : 0;
+        f.write(&cb, 1);
+        uint32_t ph = (uint32_t)e.pkh.size();
+        f.write((const char*)&ph, sizeof(ph));
+        f.write((const char*)e.pkh.data(), ph);
+
+        if (!f.good()) return false;
+        count++;
+    }
+
+    f.flush();
+    if (!f.good()) return false;
+    f.close();
+
+    // Force fsync to disk
+#if defined(_WIN32)
+    HANDLE h = CreateFileA(log_path_.c_str(), GENERIC_WRITE,
+                           FILE_SHARE_READ|FILE_SHARE_WRITE, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        FlushFileBuffers(h);
+        CloseHandle(h);
+    }
+#else
+    int fd = ::open(log_path_.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd >= 0) { ::fsync(fd); ::close(fd); }
+#endif
+
+    return true;
+}
+
 }
 

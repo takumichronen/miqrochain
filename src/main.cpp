@@ -4447,6 +4447,28 @@ static bool perform_ibd_sync(Chain& chain, P2P* p2p, const std::string& datadir,
             miq::ibd::IBDState::instance().transition_to(miq::ibd::SyncState::DONE);
 
             // ========================================================================
+            // CRITICAL FIX: Flush UTXO set to disk after IBD completes
+            // During IBD, UTXO log writes are skipped for performance (fast_sync mode).
+            // UTXOs are kept in memory but NOT persisted. If we don't flush now,
+            // UTXOs are LOST on restart, causing wallet to show wrong balance!
+            // ========================================================================
+            {
+                size_t utxo_count = chain.utxo().size();
+                if (utxo_count > 0) {
+                    log_info("=== FLUSHING UTXO SET TO DISK (" + std::to_string(utxo_count) + " UTXOs) ===");
+                    if (tui && can_tui) {
+                        tui->set_banner("Saving UTXO set to disk... (DO NOT INTERRUPT)");
+                    }
+                    if (chain.utxo().flush_to_disk()) {
+                        log_info("UTXO flush complete - wallet balance will persist across restarts");
+                    } else {
+                        log_error("UTXO flush FAILED - wallet may show wrong balance after restart!");
+                    }
+                    if (tui && can_tui) tui->set_banner("");
+                }
+            }
+
+            // ========================================================================
             // CRITICAL: Rebuild AddressIndex after IBD completes
             // During IBD, address indexing was skipped for performance
             // Now rebuild so wallet shows correct balance
