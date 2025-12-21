@@ -1561,7 +1561,9 @@ static int64_t g_stall_retry_ms = MIQ_P2P_STALL_RETRY_MS;
 // STALL FIX: Now tracks timestamp so we can allow parallel requests after delay
 static std::unordered_set<uint64_t> g_global_requested_indices;
 static std::unordered_map<uint64_t, int64_t> g_global_requested_indices_ts;  // index -> request timestamp
-static constexpr int64_t SPECULATIVE_REQUEST_DELAY_MS = 2000;  // Allow 2nd peer after 2s
+// STALL FIX: Reduced from 2000ms to 500ms for IBD
+// During IBD blocks should arrive quickly; 500ms stale allows faster failover
+static constexpr int64_t SPECULATIVE_REQUEST_DELAY_MS = 500;  // Allow 2nd peer after 500ms
 
 // Helper: Clear index from both tracking maps (must be called with lock held)
 static inline void clear_global_requested_index(uint64_t idx) {
@@ -3893,14 +3895,42 @@ void P2P::fill_index_pipeline(PeerState& ps){
     // NON-RESPONSIVE PEER DETECTION: Skip peers that have high inflight but 0 delivered
     // This prevents wasting request slots on dead peers that accept connections but never respond
     // CRITICAL: Only applies to peers that have NEVER delivered a single block
+    // CRITICAL FIX: Also ACTIVELY RECOVER the wasted inflight slots!
     if (ps.inflight_index >= 16 && ps.total_blocks_received == 0) {
         // Peer has 16+ requests pending but hasn't delivered a single block
         // Likely a dead or misbehaving peer - skip sending more requests
         static int64_t last_log_ms = 0;
-        if (now_ms() - last_log_ms > 5000) {
-            last_log_ms = now_ms();
+        static std::unordered_map<Sock, int64_t> peer_last_recovery_ms;
+        const int64_t tnow = now_ms();
+
+        // Log periodically
+        if (tnow - last_log_ms > 5000) {
+            last_log_ms = tnow;
             log_warn("[FILL-BLOCK] " + ps.ip + " blocked: inflight=" +
                      std::to_string(ps.inflight_index) + " but blocks_received=0");
+        }
+
+        // CRITICAL FIX: After 5 seconds of non-delivery, actively recover slots!
+        // This prevents the "168 inflight, 0 delivered" deadlock
+        auto& last_recovery = peer_last_recovery_ms[(Sock)ps.sock];
+        if (tnow - last_recovery > 5000) {
+            last_recovery = tnow;
+
+            // Clear all inflight tracking for this non-delivering peer
+            InflightLock lk(g_inflight_lock);
+            auto idx_it = g_inflight_index_ts.find((Sock)ps.sock);
+            if (idx_it != g_inflight_index_ts.end() && !idx_it->second.empty()) {
+                size_t cleared = idx_it->second.size();
+                for (const auto& kv : idx_it->second) {
+                    clear_global_requested_index(kv.first);
+                }
+                idx_it->second.clear();
+                g_inflight_index_order[(Sock)ps.sock].clear();
+                ps.inflight_index = 0;
+
+                log_warn("[NON-DELIVER-RECOVERY] Cleared " + std::to_string(cleared) +
+                         " dead inflight slots from " + ps.ip + " (0 blocks delivered)");
+            }
         }
         return;
     }
@@ -3919,8 +3949,11 @@ void P2P::fill_index_pipeline(PeerState& ps){
     {
         const int64_t tnow = now_ms();
         const int64_t STALE_AGE_MS = 5000;  // 5 seconds = stale
+        const int64_t DEAD_AGE_MS = 10000;  // 10 seconds = dead, clear it
 
         // Count only FRESH requests (< 5 seconds old)
+        // CRITICAL FIX: Also collect DEAD requests (> 10 seconds) for cleanup
+        std::vector<uint64_t> dead_indices;
         InflightLock lk(g_inflight_lock);
         auto it = g_inflight_index_ts.find((Sock)ps.sock);
         if (it != g_inflight_index_ts.end()) {
@@ -3931,8 +3964,34 @@ void P2P::fill_index_pipeline(PeerState& ps){
                     fresh_inflight++;
                 } else {
                     stale_inflight++;
+                    // CRITICAL FIX: Collect dead requests for cleanup
+                    if (age >= DEAD_AGE_MS) {
+                        dead_indices.push_back(kv.first);
+                    }
                 }
             }
+        }
+
+        // CRITICAL FIX: Actively clear dead requests from tracking
+        // This frees up inflight slots and allows new requests
+        if (!dead_indices.empty()) {
+            for (uint64_t idx : dead_indices) {
+                // Clear from per-peer tracking
+                g_inflight_index_ts[(Sock)ps.sock].erase(idx);
+                auto& dq = g_inflight_index_order[(Sock)ps.sock];
+                dq.erase(std::remove(dq.begin(), dq.end(), idx), dq.end());
+                // Clear from global tracking
+                clear_global_requested_index(idx);
+            }
+            // Decrement inflight_index for cleared slots
+            if (ps.inflight_index >= dead_indices.size()) {
+                ps.inflight_index -= dead_indices.size();
+            } else {
+                ps.inflight_index = 0;
+            }
+            log_info("[STALE-CLEANUP] Cleared " + std::to_string(dead_indices.size()) +
+                     " dead requests from " + ps.ip +
+                     " (inflight now=" + std::to_string(ps.inflight_index) + ")");
         }
 
         // Use fresh count for cap, not total inflight
@@ -6746,9 +6805,13 @@ void P2P::loop(){
                       log_warn("P2P: NUCLEAR RECOVERY - no active sync, forcing all peers to restart");
 
                       // Clear stale global state first
+                      // CRITICAL FIX: Must clear BOTH the index set AND the timestamp map!
+                      // Previously only cleared g_global_requested_indices, leaving stale
+                      // timestamps that could block new requests.
                       {
                           InflightLock lk(g_inflight_lock);
                           g_global_requested_indices.clear();
+                          g_global_requested_indices_ts.clear();  // ADDED: Clear timestamps too!
                       }
                       g_inflight_index_ts.clear();
                       g_inflight_index_order.clear();
@@ -7240,12 +7303,45 @@ void P2P::loop(){
                                            " to " + std::to_string(sent_count) + " peers" +
                                            (have_hash ? " [hash-based]" : " [index-based]"));
                               }
-                              // After broadcast, wait 30 more seconds before trying again
-                              // At 100ms interval, 300 attempts = 30 seconds
-                              // Reset counter at 305 to restart the request cycle
-                              if (gap_request_count >= 305) {
+
+                              // CRITICAL FIX: After broadcast, re-broadcast every 2 seconds
+                              // The old 30 second wait was catastrophic - blocks could take 163s to arrive!
+                              // At 100ms interval, 20 attempts = 2 seconds
+                              // Every 20 attempts after the initial broadcast (attempt 5), re-broadcast
+                              if (gap_request_count > 5 && ((gap_request_count - 5) % 20 == 0)) {
+                                  log_info("P2P: Re-broadcasting gap " + std::to_string(next_needed) +
+                                           " (attempt " + std::to_string(gap_request_count) + ")");
+
+                                  // Re-broadcast to ALL peers
+                                  int sent_count = 0;
+                                  for (auto& kvp : peers_) {
+                                      if (!kvp.second.verack_ok) continue;
+
+                                      if (have_hash) {
+                                          const std::string key = hexkey(block_hash);
+                                          auto msg = encode_msg("getb", block_hash);
+                                          if (send_or_close(kvp.first, msg)) {
+                                              kvp.second.inflight_blocks.insert(key);
+                                              g_global_inflight_blocks.insert(key);
+                                              sent_count++;
+                                          }
+                                      } else {
+                                          uint8_t p8[8];
+                                          for (int i = 0; i < 8; i++) p8[i] = (uint8_t)((next_needed >> (8 * i)) & 0xFF);
+                                          auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
+                                          if (send_or_close(kvp.first, msg)) {
+                                              kvp.second.inflight_index++;
+                                              sent_count++;
+                                          }
+                                      }
+                                  }
+                              }
+
+                              // Reset counter every 10 seconds (100 attempts) to restart escalation
+                              // This is still faster than the old 30s and allows fresh retry cycles
+                              if (gap_request_count >= 105) {
                                   log_info("P2P: Gap at index " + std::to_string(next_needed) +
-                                           " - retrying after 30s timeout");
+                                           " - restarting escalation after 10s");
                                   gap_request_count = 0;  // Will become 1 on next iteration
                               }
                           }
