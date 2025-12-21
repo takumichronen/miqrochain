@@ -1,9 +1,11 @@
 #include "difficulty.h"
 #include "constants.h"   // for BLOCK_TIME_SECS / GENESIS_BITS if callers pass those
+#include "log.h"         // for log_info
 #include <cstdint>
 #include <cstddef>
 #include <vector>
 #include <utility>
+#include <sstream>
 
 namespace miq {
 
@@ -69,13 +71,32 @@ uint32_t lwma_next_bits(const std::vector<std::pair<int64_t, uint32_t>>& last,
     unsigned char t[32];
     target_from_compact(last.back().second, t);
 
+    // DEBUG: Log difficulty calculation details
+    {
+        std::ostringstream oss;
+        oss << "LWMA: window=" << window << " sum=" << sum << " avg=" << avg
+            << " target_spacing=" << target_spacing << " ratio=" << (double)avg/(double)target_spacing
+            << " prev_bits=0x" << std::hex << last.back().second;
+        log_info(oss.str());
+    }
+
     for (int i = 31; i >= 0; --i) {
         unsigned int v = t[i];
         v = (unsigned int)((uint64_t)v * (uint64_t)avg / (uint64_t)target_spacing);
         if (v > 255U) v = 255U;
         t[i] = (unsigned char)v;
     }
-    return compact_from_target(t);
+
+    uint32_t result = compact_from_target(t);
+
+    // DEBUG: Log result
+    {
+        std::ostringstream oss;
+        oss << "LWMA: result_bits=0x" << std::hex << result;
+        log_info(oss.str());
+    }
+
+    return result;
 }
 
 // --- Epoch retarget: freeze inside epoch; adjust only at boundary ---
@@ -84,6 +105,16 @@ uint32_t epoch_next_bits(const std::vector<std::pair<int64_t, uint32_t>>& last,
                          uint32_t min_bits,
                          uint64_t next_height,
                          size_t interval) {
+    // DEBUG: Log epoch_next_bits call
+    {
+        std::ostringstream oss;
+        oss << "epoch_next_bits: next_height=" << next_height
+            << " interval=" << interval
+            << " last.size()=" << last.size()
+            << " at_boundary=" << ((next_height % interval) == 0 ? "YES" : "no");
+        log_info(oss.str());
+    }
+
     // If not at a boundary, keep current bits (freeze difficulty).
     if (!last.empty() && (next_height % interval) != 0) {
         return last.back().second;
@@ -97,9 +128,11 @@ uint32_t epoch_next_bits(const std::vector<std::pair<int64_t, uint32_t>>& last,
 
     if (last.size() > interval) {
         // Use only the last `interval` headers to determine the new target
+        log_info("epoch_next_bits: using tail of " + std::to_string(interval) + " headers");
         std::vector<std::pair<int64_t, uint32_t>> tail(last.end() - interval, last.end());
         return lwma_next_bits(tail, target_spacing, min_bits);
     } else {
+        log_info("epoch_next_bits: using all " + std::to_string(last.size()) + " headers");
         return lwma_next_bits(last, target_spacing, min_bits);
     }
 }
