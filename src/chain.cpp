@@ -2571,6 +2571,15 @@ bool Chain::disconnect_tip_once(std::string& err){
     tip_.issued -= cb_sum;
     tip_.work_sum -= work_from_bits(cur.header.bits);  // PERF: Update cached work
 
+    // CRITICAL FIX: Reset best_header_key_ to the new tip after block disconnect
+    // Without this, best_header_height() returns the old (higher) disconnected header height
+    // which causes compute_sync_gate() to fail with "syncing (cur/old_higher)" forever.
+    // This was causing "Finalizing..." stuck state after deleting malicious blocks.
+    best_header_key_ = hk(tip_.hash);
+
+    // Also reset the global atomic header height used by P2P and assume-valid
+    miq::reset_best_header_height(tip_.height);
+
     {
         std::lock_guard<std::mutex> lk(g_undo_mtx);
         auto it_ram2 = g_undo.find(hk(cur.block_hash()));

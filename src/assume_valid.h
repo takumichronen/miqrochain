@@ -143,6 +143,14 @@ inline void set_best_header_height(uint64_t h) {
     while (h > cur && !g_best_header_height().compare_exchange_weak(cur, h, std::memory_order_release));
 }
 
+// CRITICAL FIX: Reset header height when blocks are disconnected/invalidated
+// This is needed because disconnect_tip_once() reduces chain height, but the
+// global atomic header height would stay at the old (higher) value, causing
+// sync gates to fail indefinitely after block deletion.
+inline void reset_best_header_height(uint64_t h) {
+    g_best_header_height().store(h, std::memory_order_release);
+}
+
 // Check if we should skip signature validation for a block
 // Returns true if signatures should be validated (not skipped)
 inline bool should_validate_signatures(const std::vector<uint8_t>& block_hash, uint64_t height) {
