@@ -7347,7 +7347,6 @@ void P2P::loop(){
                                            " (attempt " + std::to_string(gap_request_count) + ")");
 
                                   // Re-broadcast to ALL peers
-                                  int sent_count = 0;
                                   for (auto& kvp : peers_) {
                                       if (!kvp.second.verack_ok) continue;
 
@@ -7357,7 +7356,6 @@ void P2P::loop(){
                                           if (send_or_close(kvp.first, msg)) {
                                               kvp.second.inflight_blocks.insert(key);
                                               g_global_inflight_blocks.insert(key);
-                                              sent_count++;
                                           }
                                       } else {
                                           uint8_t p8[8];
@@ -7365,7 +7363,6 @@ void P2P::loop(){
                                           auto msg = encode_msg("getbi", std::vector<uint8_t>(p8, p8 + 8));
                                           if (send_or_close(kvp.first, msg)) {
                                               kvp.second.inflight_index++;
-                                              sent_count++;
                                           }
                                       }
                                   }
