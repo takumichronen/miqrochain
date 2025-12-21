@@ -1616,6 +1616,100 @@ static std::atomic<uint64_t> g_diag_fill_blocked_max_index{0};
 static std::atomic<uint64_t> g_diag_fill_blocked_already_requested{0};
 static std::atomic<uint64_t> g_diag_fill_blocked_pipe_full{0};
 
+// BLOCK DOWNLOAD FLOW LOGGING: Track why sync starts/stops
+static std::atomic<uint64_t> g_diag_blocks_requested_window{0};
+static std::atomic<uint64_t> g_diag_blocks_received_window{0};
+static std::atomic<int64_t>  g_diag_last_block_received_ms{0};
+static std::atomic<int64_t>  g_diag_last_request_sent_ms{0};
+
+// Log comprehensive sync flow status (call every 10 seconds)
+static void log_sync_flow_status(miq::Chain& chain, const std::unordered_map<Sock, miq::PeerState>& peers) {
+    static int64_t last_log_ms = 0;
+    static uint64_t last_req = 0, last_recv = 0, last_proc = 0;
+    static uint64_t last_not_capable = 0, last_fork = 0, last_pending = 0;
+    static uint64_t last_max_index = 0, last_already_req = 0, last_pipe_full = 0;
+
+    int64_t now = now_ms();
+    if (now - last_log_ms < 10000) return;  // Every 10 seconds
+    last_log_ms = now;
+
+    // Get current values
+    uint64_t req = g_diag_blocks_requested.load();
+    uint64_t recv = g_diag_blocks_received.load();
+    uint64_t proc = g_diag_blocks_processed.load();
+    uint64_t not_cap = g_diag_fill_blocked_not_capable.load();
+    uint64_t fork = g_diag_fill_blocked_fork.load();
+    uint64_t pending = g_diag_fill_blocked_pending_verify.load();
+    uint64_t max_idx = g_diag_fill_blocked_max_index.load();
+    uint64_t already = g_diag_fill_blocked_already_requested.load();
+    uint64_t pipe = g_diag_fill_blocked_pipe_full.load();
+
+    // Calculate deltas
+    uint64_t d_req = req - last_req;
+    uint64_t d_recv = recv - last_recv;
+    uint64_t d_proc = proc - last_proc;
+    uint64_t d_not_cap = not_cap - last_not_capable;
+    uint64_t d_fork = fork - last_fork;
+    uint64_t d_pending = pending - last_pending;
+    uint64_t d_max_idx = max_idx - last_max_index;
+    uint64_t d_already = already - last_already_req;
+    uint64_t d_pipe = pipe - last_pipe_full;
+
+    // Save for next time
+    last_req = req; last_recv = recv; last_proc = proc;
+    last_not_capable = not_cap; last_fork = fork; last_pending = pending;
+    last_max_index = max_idx; last_already_req = already; last_pipe_full = pipe;
+
+    // Calculate stall duration
+    int64_t last_recv_ms = g_diag_last_block_received_ms.load();
+    int64_t stall_ms = (last_recv_ms > 0) ? (now - last_recv_ms) : 0;
+
+    // Count peer states
+    size_t total_peers = 0, syncing = 0, capable = 0;
+    size_t total_inflight = 0;
+    std::string peer_summary;
+    for (const auto& kv : peers) {
+        if (!kv.second.verack_ok) continue;
+        total_peers++;
+        if (kv.second.syncing) syncing++;
+        if (g_peer_index_capable[kv.first]) capable++;
+        total_inflight += kv.second.inflight_index;
+
+        // Add per-peer detail if not syncing well
+        if (kv.second.inflight_index > 0 || kv.second.total_blocks_received > 0) {
+            peer_summary += " [" + kv.second.ip + " inf=" + std::to_string(kv.second.inflight_index) +
+                          " rx=" + std::to_string(kv.second.total_blocks_received) +
+                          " next=" + std::to_string(kv.second.next_index) + "]";
+        }
+    }
+
+    uint64_t ch = chain.height();
+    uint64_t hh = chain.best_header_height();
+    uint64_t mp = g_max_known_peer_tip.load();
+
+    // Build block reason string if blocked
+    std::string block_reasons;
+    if (d_req == 0 && ch < std::max(hh, mp)) {
+        if (d_not_cap > 0) block_reasons += " NOT_CAPABLE=" + std::to_string(d_not_cap);
+        if (d_fork > 0) block_reasons += " FORK=" + std::to_string(d_fork);
+        if (d_pending > 0) block_reasons += " PENDING_VERIFY=" + std::to_string(d_pending);
+        if (d_max_idx > 0) block_reasons += " MAX_INDEX=" + std::to_string(d_max_idx);
+        if (d_already > 0) block_reasons += " ALREADY_REQ=" + std::to_string(d_already);
+        if (d_pipe > 0) block_reasons += " PIPE_FULL=" + std::to_string(d_pipe);
+        if (block_reasons.empty()) block_reasons = " (no fill_pipeline calls?)";
+    }
+
+    miq::log_info("[SYNC-FLOW] height=" + std::to_string(ch) + "/" + std::to_string(std::max(hh, mp)) +
+                  " | req=" + std::to_string(d_req) + " recv=" + std::to_string(d_recv) +
+                  " proc=" + std::to_string(d_proc) +
+                  " | inflight=" + std::to_string(total_inflight) +
+                  " | peers=" + std::to_string(total_peers) + "(sync=" + std::to_string(syncing) +
+                  " cap=" + std::to_string(capable) + ")" +
+                  " | stall=" + std::to_string(stall_ms/1000) + "s" +
+                  (block_reasons.empty() ? "" : " | BLOCKED:" + block_reasons) +
+                  peer_summary);
+}
+
 // CRITICAL FIX: Track inflight tx request timestamps for timeout cleanup
 // Without this, inflight_tx can grow forever, eventually blocking all new tx requests
 static std::unordered_map<Sock, std::unordered_map<std::string,int64_t>> g_inflight_tx_ts;
@@ -4612,6 +4706,7 @@ void P2P::queue_block_by_height(uint64_t height, const std::vector<uint8_t>& has
     }
 
     g_diag_blocks_received++;
+    g_diag_last_block_received_ms.store(now_ms(), std::memory_order_relaxed);
 
     log_info("[BLOCK-QUEUE] Queued block height=" + std::to_string(height) +
             " hash=" + hexkey(hash).substr(0, 16) +
@@ -6425,6 +6520,9 @@ void P2P::loop(){
                            " stale=" + std::to_string(total_stale) + ")" +
                            " pending_blocks=" + std::to_string(pending_blocks_.size()) +
                            peer_info);
+
+                  // COMPREHENSIVE SYNC FLOW LOG - shows why sync is blocked
+                  log_sync_flow_status(chain_, peers_);
               }
           }
 
