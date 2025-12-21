@@ -1305,6 +1305,38 @@ static std::atomic<bool> g_headers_just_done{false};
 // Global max peer tip - updated whenever we learn of higher tips
 static std::atomic<uint64_t> g_max_known_peer_tip{0};
 
+// ANTI-MALICIOUS-TIP FIX: Track when we last made header progress
+// If we can't get headers beyond our current height for 60 seconds,
+// cap g_max_known_peer_tip to best_header_height (peers may be lying)
+static std::atomic<int64_t> g_last_header_progress_ms{0};
+static std::atomic<uint64_t> g_last_header_progress_height{0};
+constexpr int64_t HEADER_STALL_TIMEOUT_MS = 60000;  // 60 seconds
+
+// Call this whenever we receive new headers that extend our chain
+static void on_header_progress(uint64_t new_height) {
+    g_last_header_progress_height.store(new_height, std::memory_order_relaxed);
+    g_last_header_progress_ms.store(now_ms(), std::memory_order_relaxed);
+}
+
+// Call periodically to check if we're stuck and need to cap max_peer_tip
+static void check_header_stall_and_cap_target() {
+    int64_t last_progress = g_last_header_progress_ms.load(std::memory_order_relaxed);
+    if (last_progress == 0) return;  // Never started
+
+    uint64_t hdr_height = g_chain_ptr ? g_chain_ptr->best_header_height() : 0;
+    uint64_t max_peer = g_max_known_peer_tip.load(std::memory_order_relaxed);
+
+    // If max_peer_tip > our headers and we've been stuck for 60+ seconds
+    if (max_peer > hdr_height + 10 && (now_ms() - last_progress) > HEADER_STALL_TIMEOUT_MS) {
+        // Cap max_peer_tip to our validated header height
+        // This prevents malicious peers from keeping us stuck forever
+        miq::log_warn("P2P: ANTI-MALICIOUS-TIP: No header progress for 60s, capping target from " +
+                      std::to_string(max_peer) + " to " + std::to_string(hdr_height) +
+                      " (peers may be announcing invalid chain)");
+        g_max_known_peer_tip.store(hdr_height, std::memory_order_relaxed);
+    }
+}
+
 // FORCE-COMPLETION MODE: When we're ≤16 blocks from tip, enable aggressive completion
 // In this mode: allow duplicate requests, relax limits, ignore peer penalties
 static std::atomic<bool> g_force_completion_mode{false};
@@ -1585,6 +1617,100 @@ static std::atomic<uint64_t> g_diag_fill_blocked_pending_verify{0};
 static std::atomic<uint64_t> g_diag_fill_blocked_max_index{0};
 static std::atomic<uint64_t> g_diag_fill_blocked_already_requested{0};
 static std::atomic<uint64_t> g_diag_fill_blocked_pipe_full{0};
+
+// BLOCK DOWNLOAD FLOW LOGGING: Track why sync starts/stops
+static std::atomic<uint64_t> g_diag_blocks_requested_window{0};
+static std::atomic<uint64_t> g_diag_blocks_received_window{0};
+static std::atomic<int64_t>  g_diag_last_block_received_ms{0};
+static std::atomic<int64_t>  g_diag_last_request_sent_ms{0};
+
+// Log comprehensive sync flow status (call every 10 seconds)
+static void log_sync_flow_status(miq::Chain& chain, const std::unordered_map<Sock, miq::PeerState>& peers) {
+    static int64_t last_log_ms = 0;
+    static uint64_t last_req = 0, last_recv = 0, last_proc = 0;
+    static uint64_t last_not_capable = 0, last_fork = 0, last_pending = 0;
+    static uint64_t last_max_index = 0, last_already_req = 0, last_pipe_full = 0;
+
+    int64_t now = now_ms();
+    if (now - last_log_ms < 10000) return;  // Every 10 seconds
+    last_log_ms = now;
+
+    // Get current values
+    uint64_t req = g_diag_blocks_requested.load();
+    uint64_t recv = g_diag_blocks_received.load();
+    uint64_t proc = g_diag_blocks_processed.load();
+    uint64_t not_cap = g_diag_fill_blocked_not_capable.load();
+    uint64_t fork = g_diag_fill_blocked_fork.load();
+    uint64_t pending = g_diag_fill_blocked_pending_verify.load();
+    uint64_t max_idx = g_diag_fill_blocked_max_index.load();
+    uint64_t already = g_diag_fill_blocked_already_requested.load();
+    uint64_t pipe = g_diag_fill_blocked_pipe_full.load();
+
+    // Calculate deltas
+    uint64_t d_req = req - last_req;
+    uint64_t d_recv = recv - last_recv;
+    uint64_t d_proc = proc - last_proc;
+    uint64_t d_not_cap = not_cap - last_not_capable;
+    uint64_t d_fork = fork - last_fork;
+    uint64_t d_pending = pending - last_pending;
+    uint64_t d_max_idx = max_idx - last_max_index;
+    uint64_t d_already = already - last_already_req;
+    uint64_t d_pipe = pipe - last_pipe_full;
+
+    // Save for next time
+    last_req = req; last_recv = recv; last_proc = proc;
+    last_not_capable = not_cap; last_fork = fork; last_pending = pending;
+    last_max_index = max_idx; last_already_req = already; last_pipe_full = pipe;
+
+    // Calculate stall duration
+    int64_t last_recv_ms = g_diag_last_block_received_ms.load();
+    int64_t stall_ms = (last_recv_ms > 0) ? (now - last_recv_ms) : 0;
+
+    // Count peer states
+    size_t total_peers = 0, syncing = 0, capable = 0;
+    size_t total_inflight = 0;
+    std::string peer_summary;
+    for (const auto& kv : peers) {
+        if (!kv.second.verack_ok) continue;
+        total_peers++;
+        if (kv.second.syncing) syncing++;
+        if (g_peer_index_capable[kv.first]) capable++;
+        total_inflight += kv.second.inflight_index;
+
+        // Add per-peer detail if not syncing well
+        if (kv.second.inflight_index > 0 || kv.second.total_blocks_received > 0) {
+            peer_summary += " [" + kv.second.ip + " inf=" + std::to_string(kv.second.inflight_index) +
+                          " rx=" + std::to_string(kv.second.total_blocks_received) +
+                          " next=" + std::to_string(kv.second.next_index) + "]";
+        }
+    }
+
+    uint64_t ch = chain.height();
+    uint64_t hh = chain.best_header_height();
+    uint64_t mp = g_max_known_peer_tip.load();
+
+    // Build block reason string if blocked
+    std::string block_reasons;
+    if (d_req == 0 && ch < std::max(hh, mp)) {
+        if (d_not_cap > 0) block_reasons += " NOT_CAPABLE=" + std::to_string(d_not_cap);
+        if (d_fork > 0) block_reasons += " FORK=" + std::to_string(d_fork);
+        if (d_pending > 0) block_reasons += " PENDING_VERIFY=" + std::to_string(d_pending);
+        if (d_max_idx > 0) block_reasons += " MAX_INDEX=" + std::to_string(d_max_idx);
+        if (d_already > 0) block_reasons += " ALREADY_REQ=" + std::to_string(d_already);
+        if (d_pipe > 0) block_reasons += " PIPE_FULL=" + std::to_string(d_pipe);
+        if (block_reasons.empty()) block_reasons = " (no fill_pipeline calls?)";
+    }
+
+    miq::log_info("[SYNC-FLOW] height=" + std::to_string(ch) + "/" + std::to_string(std::max(hh, mp)) +
+                  " | req=" + std::to_string(d_req) + " recv=" + std::to_string(d_recv) +
+                  " proc=" + std::to_string(d_proc) +
+                  " | inflight=" + std::to_string(total_inflight) +
+                  " | peers=" + std::to_string(total_peers) + "(sync=" + std::to_string(syncing) +
+                  " cap=" + std::to_string(capable) + ")" +
+                  " | stall=" + std::to_string(stall_ms/1000) + "s" +
+                  (block_reasons.empty() ? "" : " | BLOCKED:" + block_reasons) +
+                  peer_summary);
+}
 
 // CRITICAL FIX: Track inflight tx request timestamps for timeout cleanup
 // Without this, inflight_tx can grow forever, eventually blocking all new tx requests
@@ -4241,12 +4367,15 @@ bool P2P::request_block_index(PeerState& ps, uint64_t index){
 
             // Use hash-based request
             auto msg = encode_msg("getb", block_hash);
+            log_info("[BLOCK-REQ] idx=" + std::to_string(index) + " hash=" + key.substr(0, 16) +
+                    " from " + ps.ip + " (hash-based)");
             if (send_or_close(ps.sock, msg)) {
                 ps.inflight_blocks.insert(key);
                 g_global_inflight_blocks.insert(key);
                 P2P_TRACE("TX " + ps.ip + " getb (hash-based) for index " + std::to_string(index));
                 return true;
             }
+            log_warn("[BLOCK-REQ] SEND FAILED idx=" + std::to_string(index) + " to " + ps.ip);
             // Send failed - remove from tracking
             {
                 InflightLock lk(g_inflight_lock);
@@ -4326,6 +4455,11 @@ void P2P::request_block_hash(PeerState& ps, const std::vector<uint8_t>& h){
     }
 
     auto msg = encode_msg("getb", h);
+    // DIAG: Log block request with height info
+    int64_t req_height = chain_.get_header_height(h);
+    log_info("[BLOCK-REQ] Requesting block hash=" + key.substr(0, 16) + " height=" +
+            std::to_string(req_height >= 0 ? req_height : -1) + " from " + ps.ip);
+
     if (send_or_close(ps.sock, msg)) {
         ps.inflight_blocks.insert(key);
         mark_block_inflight(key, (Sock)ps.sock);
@@ -4625,9 +4759,19 @@ void P2P::remove_orphan_by_hex(const std::string& child_hex){
 void P2P::queue_block_by_height(uint64_t height, const std::vector<uint8_t>& hash,
                                  const std::vector<uint8_t>& raw) {
     // Don't queue if we already have it
-    if (pending_blocks_.count(height)) return;
+    if (pending_blocks_.count(height)) {
+        log_info("[BLOCK-QUEUE] Block height=" + std::to_string(height) +
+                " hash=" + hexkey(hash).substr(0, 16) + " already queued - skipping");
+        return;
+    }
 
     g_diag_blocks_received++;
+    g_diag_last_block_received_ms.store(now_ms(), std::memory_order_relaxed);
+
+    log_info("[BLOCK-QUEUE] Queued block height=" + std::to_string(height) +
+            " hash=" + hexkey(hash).substr(0, 16) +
+            " chain_height=" + std::to_string(chain_.height()) +
+            " pending=" + std::to_string(pending_blocks_.size()));
 
     PendingBlock pb;
     pb.hash = hash;
@@ -4861,9 +5005,12 @@ void P2P::process_pending_blocks() {
         std::string err;
         uint64_t new_height = 0;
         // RACE FIX: Capture height atomically during submit (under chain lock)
+        log_info("[BLOCK-SUBMIT] Submitting block height=" + std::to_string(next_height) +
+                " hash=" + hexkey(b.block_hash()).substr(0, 16));
         bool accepted = chain_.submit_block(b, err, &new_height);
 
         if (accepted) {
+            log_info("[BLOCK-SUBMIT] SUCCESS height=" + std::to_string(new_height));
             blocks_processed++;
             g_diag_blocks_processed++;
 
@@ -4950,8 +5097,9 @@ void P2P::process_pending_blocks() {
             next_height = current_height + 1;
         } else {
             // Block rejected - log and remove
-            log_warn("P2P: pending block at height " + std::to_string(next_height) +
-                     " rejected: " + err);
+            log_warn("[BLOCK-SUBMIT] REJECTED height=" + std::to_string(next_height) +
+                     " hash=" + hexkey(b.block_hash()).substr(0, 16) +
+                     " error=\"" + err + "\"");
             pending_blocks_bytes_ -= it->second.raw.size();
             pending_blocks_.erase(it);
 
@@ -6375,6 +6523,10 @@ void P2P::loop(){
               const int64_t tnow = now_ms();
               if (tnow - last_diag_ms > 5000) {
                   last_diag_ms = tnow;
+
+                  // ANTI-MALICIOUS-TIP: Check if peers are lying about their height
+                  check_header_stall_and_cap_target();
+
                   const uint64_t ch = chain_.height();
                   const uint64_t hh = chain_.best_header_height();
                   const uint64_t mp = g_max_known_peer_tip.load();
@@ -6428,6 +6580,9 @@ void P2P::loop(){
                            " stale=" + std::to_string(total_stale) + ")" +
                            " pending_blocks=" + std::to_string(pending_blocks_.size()) +
                            peer_info);
+
+                  // COMPREHENSIVE SYNC FLOW LOG - shows why sync is blocked
+                  log_sync_flow_status(chain_, peers_);
               }
           }
 
@@ -8514,9 +8669,21 @@ void P2P::loop(){
                 // Track total bytes received for network stats
                 p2p_stats::bytes_recv.fetch_add((uint64_t)n, std::memory_order_relaxed);
 
-                // Log received bytes during handshake phase for diagnostics
+                // Log received bytes for diagnostics
                 if (!ps.verack_ok) {
                     log_info("P2P: received " + std::to_string(n) + " bytes from " + ps.ip + " (handshake in progress)");
+                } else {
+                    // SYNC DIAG: Track bytes received post-handshake
+                    static std::atomic<uint64_t> s_last_recv_log_ms{0};
+                    static std::atomic<uint64_t> s_bytes_since_log{0};
+                    s_bytes_since_log.fetch_add((uint64_t)n, std::memory_order_relaxed);
+                    uint64_t now = (uint64_t)now_ms();
+                    uint64_t last = s_last_recv_log_ms.load(std::memory_order_relaxed);
+                    if (now - last > 10000) {  // Log every 10 seconds
+                        uint64_t bytes = s_bytes_since_log.exchange(0, std::memory_order_relaxed);
+                        s_last_recv_log_ms.store(now, std::memory_order_relaxed);
+                        log_info("[SYNC-RX] Received " + std::to_string(bytes) + " bytes in last 10s from all peers");
+                    }
                 }
 
                 ps.last_ms = now_ms();
@@ -8927,6 +9094,13 @@ void P2P::loop(){
                                     if (g_max_known_peer_tip.compare_exchange_weak(old_max, announced_height)) {
                                         log_info("P2P: New max peer tip discovered: " + std::to_string(announced_height));
                                         tip_increased = true;
+
+                                        // ANTI-MALICIOUS-TIP: Start timer when we learn of higher tip
+                                        // If we can't get headers to this height within 60s, assume peer is lying
+                                        uint64_t our_hdr = chain_.best_header_height();
+                                        if (g_last_header_progress_ms.load() == 0) {
+                                            on_header_progress(our_hdr);  // Start the timer
+                                        }
                                         break;
                                     }
                                 }
@@ -9248,6 +9422,10 @@ void P2P::loop(){
                             // This allows should_validate_signatures() to skip signatures for
                             // deeply buried blocks during IBD
                             miq::set_best_header_height(new_header_height);
+
+                            // ANTI-MALICIOUS-TIP: Track header progress for stall detection
+                            on_header_progress(new_header_height);
+
                             uint64_t old_max = g_max_known_peer_tip.load();
                             while (new_header_height > old_max) {
                                 if (g_max_known_peer_tip.compare_exchange_weak(old_max, new_header_height)) {
@@ -9461,21 +9639,16 @@ void P2P::loop(){
 
                         const uint64_t our_height = chain_.height();
 
-                        // CRITICAL FIX: Only apply IBD isolation if we have NO blocks to serve
-                        // The original code rejected ALL requests during IBD, even from nodes
-                        // that needed blocks we have. This caused mutual deadlock when both
-                        // nodes were in IBD mode - neither would serve blocks to the other!
-                        //
-                        // New logic: If we have blocks (our_height > 0), ALWAYS serve them.
-                        // The purpose of a blockchain is to share blocks!
-                        if (miq::is_ibd_mode() && our_height == 0) {
-                            // We're syncing and have no blocks - nothing to serve anyway
-                            // Skip serving to focus resources on downloading
+                        // IBD SYNC FIX: Only skip serving if we have NO blocks at all
+                        // Previously this was too aggressive and prevented nodes from serving
+                        // each other during sync, causing a deadlock. Now we serve any blocks
+                        // we have, even during IBD.
+                        if (our_height == 0) {
                             static int64_t last_reject_log_ms = 0;
                             if (now_ms() - last_reject_log_ms > 5000) {
                                 last_reject_log_ms = now_ms();
-                                log_info("P2P: IBD - Cannot serve getb from " + ps.ip +
-                                         " (we have no blocks yet)");
+                                log_info("P2P: No blocks to serve - Ignoring getb from " + ps.ip +
+                                         " (our_height=0)");
                             }
                             continue;
                         }
@@ -9485,22 +9658,35 @@ void P2P::loop(){
                         g_peer_last_request_ms[(Sock)ps.sock] = now_ms();
                         if (m.payload.size() == 32) {
                             std::string hash_hex = hexkey(m.payload);
-                            P2P_TRACE("DEBUG: getb request for hash " + hash_hex + " from " + ps.ip);
+                            log_info("[GETB-RX] Request for hash=" + hash_hex.substr(0, 16) + " from " + ps.ip);
 
                             Block b;
-                            if (chain_.get_block_by_hash(m.payload, b)) {
+                            bool found = chain_.get_block_by_hash(m.payload, b);
+
+                            // SYNC FIX: If block not found, try reversed hash (endianness compatibility)
+                            // Some peers may use different byte order for hashes
+                            if (!found) {
+                                std::vector<uint8_t> rev_payload = m.payload;
+                                std::reverse(rev_payload.begin(), rev_payload.end());
+                                found = chain_.get_block_by_hash(rev_payload, b);
+                                if (found) {
+                                    log_info("[GETB-RX] Found block with REVERSED hash=" + hash_hex.substr(0, 16));
+                                }
+                            }
+
+                            if (found) {
                                 auto raw = ser_block(b);
-                                P2P_TRACE("DEBUG: Found block by hash " + hash_hex + ", size=" + std::to_string(raw.size()) + " bytes");
+                                log_info("[GETB-TX] Sending block hash=" + hash_hex.substr(0, 16) + " size=" + std::to_string(raw.size()) + " to " + ps.ip);
                                 if (raw.size() <= MIQ_FALLBACK_MAX_MSG_SIZE) {
                                     send_block(s, raw);
                                 } else {
-                                    P2P_TRACE("DEBUG: Block " + hash_hex + " too large (" + std::to_string(raw.size()) + " > " + std::to_string(MIQ_FALLBACK_MAX_MSG_SIZE) + ")");
+                                    log_warn("[GETB-TX] Block too large: " + std::to_string(raw.size()) + " > " + std::to_string(MIQ_FALLBACK_MAX_MSG_SIZE));
                                 }
                             } else {
-                                P2P_TRACE("DEBUG: Block not found by hash " + hash_hex);
+                                log_warn("[GETB-RX] Block NOT FOUND hash=" + hash_hex.substr(0, 16) + " height=" + std::to_string(chain_.height()));
                             }
                         } else {
-                            P2P_TRACE("DEBUG: getb invalid payload size " + std::to_string(m.payload.size()) + " (expected 32)");
+                            log_warn("[GETB-RX] Invalid payload size " + std::to_string(m.payload.size()) + " (expected 32)");
                         }
                     }
                     else if (cmd == "getbi") {
@@ -9509,16 +9695,18 @@ void P2P::loop(){
                             continue;
                         }
 
+                        // IBD SYNC FIX: Only skip serving if we have NO blocks at all
+                        // Previously this was too aggressive and prevented nodes from serving
+                        // each other during sync, causing a deadlock. Now we serve any blocks
+                        // we have, even during IBD.
                         const uint64_t our_height = chain_.height();
 
-                        // CRITICAL FIX: Same as getb - only isolate if we have no blocks
-                        // If we have blocks, ALWAYS serve them regardless of IBD state.
-                        if (miq::is_ibd_mode() && our_height == 0) {
+                        if (our_height == 0) {
                             static int64_t last_reject_log_ms = 0;
                             if (now_ms() - last_reject_log_ms > 5000) {
                                 last_reject_log_ms = now_ms();
-                                log_info("P2P: IBD - Cannot serve getbi from " + ps.ip +
-                                         " (we have no blocks yet)");
+                                log_info("P2P: No blocks to serve - Ignoring getbi from " + ps.ip +
+                                         " (our_height=0)");
                             }
                             continue;
                         }
@@ -9688,7 +9876,12 @@ void P2P::loop(){
 
                     } else if (cmd == "block") {
                         g_peer_last_fetch_ms[(Sock)ps.sock] = now_ms();
+
+                        // DIAG: Log every block message received
+                        log_info("[BLOCK-RX] Received block message from " + ps.ip + " size=" + std::to_string(m.payload.size()));
+
                         if (!rate_consume_block(ps, m.payload.size())) {
+                            log_warn("[BLOCK-RX] DROPPED: rate limit exceeded from " + ps.ip);
                             if (!ibd_or_fetch_active(ps, now_ms())) {
                                 if ((ps.banscore += 5) >= MIQ_P2P_MAX_BANSCORE) bump_ban(ps, ps.ip, "block-rate", now_ms());
                             }
@@ -9696,16 +9889,33 @@ void P2P::loop(){
                         }
                         if (m.payload.size() > 0 && m.payload.size() <= MIQ_FALLBACK_MAX_BLOCK_SZ) {
                             Block hb;
-                            if (!deser_block(m.payload, hb)) { if (++ps.mis > 10) { dead.push_back(s); } continue; }
+                            if (!deser_block(m.payload, hb)) {
+                                log_warn("[BLOCK-RX] DROPPED: deser_block failed from " + ps.ip);
+                                if (++ps.mis > 10) { dead.push_back(s); }
+                                continue;
+                            }
 
                             const std::string bh = hexkey(hb.block_hash());
+                            int64_t rx_parent_height = chain_.get_header_height(hb.header.prev_hash);
+                            uint64_t rx_block_height = (rx_parent_height >= 0) ? (uint64_t)(rx_parent_height + 1) : 0;
+
+                            log_info("[BLOCK-RX] Block hash=" + bh.substr(0, 16) + " height=" +
+                                    std::to_string(rx_block_height) + " from " + ps.ip +
+                                    " inflight=" + std::to_string(ps.inflight_blocks.count(bh) ? 1 : 0));
+
                             bool drop_unsolicited = false;
                             if (!ps.syncing) {
                                 // During headers phase we prefer liveness: take orphan and chase parent.
                                 const bool in_headers_phase = !g_logged_headers_done;
                                 bool parent_known = chain_.header_exists(hb.header.prev_hash) || chain_.have_block(hb.header.prev_hash);
                                 if (!parent_known && !in_headers_phase) {
-                                    if (unsolicited_drop(ps, "block", bh)) drop_unsolicited = true;
+                                    if (unsolicited_drop(ps, "block", bh)) {
+                                        log_warn("[BLOCK-RX] DROPPED as unsolicited: " + bh.substr(0, 16) +
+                                                " height=" + std::to_string(rx_block_height) + " from " + ps.ip +
+                                                " (syncing=" + std::to_string(ps.syncing) +
+                                                " parent_known=" + std::to_string(parent_known) + ")");
+                                        drop_unsolicited = true;
+                                    }
                                 }
                             }
                             if (drop_unsolicited) {
