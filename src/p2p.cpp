@@ -6634,7 +6634,8 @@ void P2P::loop(){
           if (miq::is_ibd_mode()) {
               static int64_t last_non_deliver_check_ms = 0;
               const int64_t tnow = now_ms();
-              const int64_t NON_DELIVER_TIMEOUT_MS = 30000;  // 30 seconds (was 60s)
+              // TIMING FIX: Reduced from 30s to 10s for faster recovery from dead peers
+              const int64_t NON_DELIVER_TIMEOUT_MS = 10000;  // 10 seconds
 
               if (tnow - last_non_deliver_check_ms > 5000) {  // Check every 5s (was 10s)
                   last_non_deliver_check_ms = tnow;
@@ -6648,11 +6649,39 @@ void P2P::loop(){
                       if (connection_duration > NON_DELIVER_TIMEOUT_MS &&
                           ps.total_blocks_received == 0 &&
                           ps.peer_tip_height > 0) {
+
+                          // CRITICAL FIX: Never disconnect if this would leave us with 0 peers!
+                          // Count how many verack peers we have
+                          size_t verack_peers = 0;
+                          for (const auto& p : peers_) {
+                              if (p.second.verack_ok) verack_peers++;
+                          }
+                          if (verack_peers <= 1) {
+                              log_warn("P2P: NOT disconnecting non-delivering peer " + ps.ip +
+                                       " - it's our only peer! (would leave 0 peers)");
+                              // Don't disconnect, but clear their inflight to allow recovery
+                              Sock s = kvp.first;
+                              {
+                                  InflightLock lk(g_inflight_lock);
+                                  auto idx_it = g_inflight_index_ts.find(s);
+                                  if (idx_it != g_inflight_index_ts.end()) {
+                                      for (const auto& kv : idx_it->second) {
+                                          g_global_requested_indices.erase(kv.first);
+                                          g_global_requested_indices_ts.erase(kv.first);
+                                      }
+                                      idx_it->second.clear();
+                                  }
+                                  g_inflight_index_order[s].clear();
+                              }
+                              ps.inflight_index = 0;
+                              continue;  // Don't disconnect
+                          }
+
                           // Peer claims to have blocks but delivered zero
                           log_warn("P2P: Disconnecting non-delivering peer " + ps.ip +
                                    " (connected " + std::to_string(connection_duration/1000) + "s" +
                                    ", claims tip=" + std::to_string(ps.peer_tip_height) +
-                                   ", delivered=0 blocks)");
+                                   ", delivered=0 blocks, remaining=" + std::to_string(verack_peers - 1) + ")");
 
                           // Clear inflight tracking for this peer
                           Sock s = kvp.first;
@@ -6662,6 +6691,7 @@ void P2P::loop(){
                               if (idx_it != g_inflight_index_ts.end()) {
                                   for (const auto& kv : idx_it->second) {
                                       g_global_requested_indices.erase(kv.first);
+                                      g_global_requested_indices_ts.erase(kv.first);
                                   }
                               }
                           }
@@ -6766,7 +6796,8 @@ void P2P::loop(){
                   // COOLDOWN FIX: Track last trigger time and last height to prevent thrashing
                   static int64_t last_nuclear_trigger_ms = 0;
                   static uint64_t last_nuclear_height = 0;
-                  const int64_t nuclear_cooldown_ms = 30000;  // 30 second cooldown between nuclear events
+                  // TIMING FIX: Reduced from 30s to 10s during IBD for faster recovery
+                  const int64_t nuclear_cooldown_ms = miq::is_ibd_mode() ? 10000 : 30000;
 
                   bool needs_recovery = false;
                   if (!any_active && total_inflight == 0 && global_inflight == 0) {
@@ -7084,18 +7115,21 @@ void P2P::loop(){
                           // request it either. This caused sync stalls at height 1412!
                           if (gap_request_count <= 5) {
                               // Clear from global tracking to allow fresh request
+                              // RACE FIX: Extend lock to cover ALL tracking operations
+                              // Previously g_inflight_index_ts was accessed outside lock (data race)
                               {
                                   InflightLock lk(g_inflight_lock);
                                   g_global_requested_indices.erase(next_needed);
-                              }
+                                  g_global_requested_indices_ts.erase(next_needed);
 
-                              // Also clear from all peer tracking
-                              for (auto& kv : g_inflight_index_ts) {
-                                  kv.second.erase(next_needed);
-                              }
-                              for (auto& kv : g_inflight_index_order) {
-                                  auto& dq = kv.second;
-                                  dq.erase(std::remove(dq.begin(), dq.end(), next_needed), dq.end());
+                                  // Also clear from all peer tracking (INSIDE the lock now)
+                                  for (auto& kv : g_inflight_index_ts) {
+                                      kv.second.erase(next_needed);
+                                  }
+                                  for (auto& kv : g_inflight_index_order) {
+                                      auto& dq = kv.second;
+                                      dq.erase(std::remove(dq.begin(), dq.end(), next_needed), dq.end());
+                                  }
                               }
                           }
 
@@ -9589,20 +9623,21 @@ void P2P::loop(){
                             }
 
                             // Clear this index from inflight tracking for this peer
-                            auto it_idx = g_inflight_index_ts[(Sock)s].find(idx64);
-                            if (it_idx != g_inflight_index_ts[(Sock)s].end()) {
-                                g_inflight_index_ts[(Sock)s].erase(it_idx);
-                            }
-                            auto& dq_idx = g_inflight_index_order[(Sock)s];
-                            auto dq_it = std::find(dq_idx.begin(), dq_idx.end(), idx64);
-                            if (dq_it != dq_idx.end()) {
-                                dq_idx.erase(dq_it);
-                            }
-
-                            // Clear from global tracking so another peer can try
+                            // RACE FIX: All tracking operations must be under the same lock
                             {
                                 InflightLock lk(g_inflight_lock);
+                                auto it_idx = g_inflight_index_ts[(Sock)s].find(idx64);
+                                if (it_idx != g_inflight_index_ts[(Sock)s].end()) {
+                                    g_inflight_index_ts[(Sock)s].erase(it_idx);
+                                }
+                                auto& dq_idx = g_inflight_index_order[(Sock)s];
+                                auto dq_it = std::find(dq_idx.begin(), dq_idx.end(), idx64);
+                                if (dq_it != dq_idx.end()) {
+                                    dq_idx.erase(dq_it);
+                                }
+                                // Clear from global tracking so another peer can try
                                 g_global_requested_indices.erase(idx64);
+                                g_global_requested_indices_ts.erase(idx64);
                             }
 
                             if (ps.inflight_index > 0) {
@@ -9838,38 +9873,40 @@ void P2P::loop(){
                             }
 
                             // Additional cleanup: Try to clear from per-peer tracking too
-                            if (!g_inflight_index_ts[(Sock)s].empty()) {
-                                // Verify this index is in THIS peer's inflight tracking
-                                bool found_in_peer = false;
-                                if (delivered_idx != 0) {
-                                    auto it_verify = g_inflight_index_ts[(Sock)s].find(delivered_idx);
-                                    if (it_verify != g_inflight_index_ts[(Sock)s].end()) {
-                                        found_in_peer = true;
+                            // RACE FIX: All tracking operations must be under the same lock
+                            {
+                                InflightLock lk(g_inflight_lock);
+                                if (!g_inflight_index_ts[(Sock)s].empty()) {
+                                    // Verify this index is in THIS peer's inflight tracking
+                                    bool found_in_peer = false;
+                                    if (delivered_idx != 0) {
+                                        auto it_verify = g_inflight_index_ts[(Sock)s].find(delivered_idx);
+                                        if (it_verify != g_inflight_index_ts[(Sock)s].end()) {
+                                            found_in_peer = true;
+                                        }
                                     }
-                                }
 
-                                // Try to clear the identified index from per-peer tracking
-                                bool cleared = false;
-                                if (found_in_peer) {
-                                    g_inflight_index_ts[(Sock)s].erase(delivered_idx);
-                                    auto& dq_idx = g_inflight_index_order[(Sock)s];
-                                    auto dq_it = std::find(dq_idx.begin(), dq_idx.end(), delivered_idx);
-                                    if (dq_it != dq_idx.end()) {
-                                        dq_idx.erase(dq_it);
+                                    // Try to clear the identified index from per-peer tracking
+                                    bool cleared = false;
+                                    if (found_in_peer) {
+                                        g_inflight_index_ts[(Sock)s].erase(delivered_idx);
+                                        auto& dq_idx = g_inflight_index_order[(Sock)s];
+                                        auto dq_it = std::find(dq_idx.begin(), dq_idx.end(), delivered_idx);
+                                        if (dq_it != dq_idx.end()) {
+                                            dq_idx.erase(dq_it);
+                                        }
+                                        cleared = true;
                                     }
-                                    cleared = true;
-                                }
 
-                                // If we couldn't clear specific index, clear the oldest one
-                                // This keeps per-peer tracking roughly accurate
-                                if (!cleared && !g_inflight_index_order[(Sock)s].empty()) {
-                                    uint64_t oldest = g_inflight_index_order[(Sock)s].front();
-                                    g_inflight_index_order[(Sock)s].pop_front();
-                                    g_inflight_index_ts[(Sock)s].erase(oldest);
-                                    // Also clear from global (might be different from delivered_idx)
-                                    {
-                                        InflightLock lk(g_inflight_lock);
+                                    // If we couldn't clear specific index, clear the oldest one
+                                    // This keeps per-peer tracking roughly accurate
+                                    if (!cleared && !g_inflight_index_order[(Sock)s].empty()) {
+                                        uint64_t oldest = g_inflight_index_order[(Sock)s].front();
+                                        g_inflight_index_order[(Sock)s].pop_front();
+                                        g_inflight_index_ts[(Sock)s].erase(oldest);
+                                        // Also clear from global (might be different from delivered_idx)
                                         g_global_requested_indices.erase(oldest);
+                                        g_global_requested_indices_ts.erase(oldest);
                                     }
                                 }
                             }
