@@ -1,9 +1,11 @@
 #include "difficulty.h"
 #include "constants.h"   // for BLOCK_TIME_SECS / GENESIS_BITS if callers pass those
+#include "log.h"         // for logging
 #include <cstdint>
 #include <cstddef>
 #include <vector>
 #include <utility>
+#include <cstring>
 
 namespace miq {
 
@@ -46,9 +48,110 @@ static inline void target_from_compact(uint32_t bits, unsigned char* out) {
     }
 }
 
-// --- LWMA (kept; window implied by size of `last`) ---
-uint32_t lwma_next_bits(const std::vector<std::pair<int64_t, uint32_t>>& last,
-                        int64_t target_spacing, uint32_t min_bits) {
+// ============================================================================
+// 256-bit arithmetic for proper difficulty scaling
+// ============================================================================
+
+// Multiply 256-bit target (big-endian) by numerator, divide by denominator
+// Uses proper carry propagation to avoid truncation bugs
+static void scale_target_256(unsigned char* t, uint64_t num, uint64_t denom) {
+    if (denom == 0) return;  // Safety check
+    if (num == denom) return; // No scaling needed
+
+    // Convert big-endian bytes to 4x uint64_t (little-endian word order for easier math)
+    // t[0..7] -> words[3], t[8..15] -> words[2], t[16..23] -> words[1], t[24..31] -> words[0]
+    uint64_t words[4] = {0, 0, 0, 0};
+    for (int w = 0; w < 4; ++w) {
+        int base = (3 - w) * 8;  // t[0..7] for w=3, t[8..15] for w=2, etc.
+        for (int b = 0; b < 8; ++b) {
+            words[w] = (words[w] << 8) | t[base + b];
+        }
+    }
+
+    // Multiply by num: result is 320-bit (5 words) to handle overflow
+    // We multiply each word by num, propagate carry
+    __uint128_t carry = 0;
+    uint64_t result[5] = {0, 0, 0, 0, 0};
+    for (int w = 0; w < 4; ++w) {
+        __uint128_t prod = (__uint128_t)words[w] * num + carry;
+        result[w] = (uint64_t)prod;
+        carry = prod >> 64;
+    }
+    result[4] = (uint64_t)carry;
+
+    // Divide by denom: long division from most significant word down
+    uint64_t remainder = 0;
+    for (int w = 4; w >= 0; --w) {
+        __uint128_t div_in = ((__uint128_t)remainder << 64) | result[w];
+        result[w] = (uint64_t)(div_in / denom);
+        remainder = (uint64_t)(div_in % denom);
+    }
+
+    // Check if result overflows 256 bits (words[4] != 0)
+    // If so, clamp to max target (all 0xFF)
+    if (result[4] != 0) {
+        for (int i = 0; i < 32; i++) t[i] = 0xFF;
+        return;
+    }
+
+    // Convert back to big-endian bytes
+    for (int w = 0; w < 4; ++w) {
+        int base = (3 - w) * 8;
+        uint64_t word = result[w];
+        for (int b = 7; b >= 0; --b) {
+            t[base + b] = (unsigned char)(word & 0xFF);
+            word >>= 8;
+        }
+    }
+}
+
+// Check if target is all zeros
+static bool is_target_zero(const unsigned char* t) {
+    for (int i = 0; i < 32; i++) {
+        if (t[i] != 0) return false;
+    }
+    return true;
+}
+
+// ============================================================================
+// Activation height for difficulty fix - blocks before this use legacy algorithm
+// ============================================================================
+static constexpr uint64_t DIFFICULTY_FIX_ACTIVATION_HEIGHT = 7884;
+
+// --- Legacy LWMA (original broken algorithm - for consensus with old blocks) ---
+static uint32_t lwma_next_bits_legacy(const std::vector<std::pair<int64_t, uint32_t>>& last,
+                                      int64_t target_spacing, uint32_t min_bits) {
+    if (last.size() < 2) return min_bits;
+
+    size_t window = (last.size() < 90) ? last.size() : 90;
+    int64_t sum = 0;
+
+    for (size_t i = last.size() - window + 1; i < last.size(); ++i) {
+        int64_t dt = last[i].first - last[i - 1].first;
+        if (dt < 1) dt = 1;
+        int64_t cap = target_spacing * 10;
+        if (dt > cap) dt = cap;
+        sum += dt;
+    }
+
+    int64_t avg = sum / (int64_t)(window - 1);
+
+    // LEGACY: byte-by-byte scaling with capping (has underflow bug at high difficulty)
+    unsigned char t[32];
+    target_from_compact(last.back().second, t);
+
+    for (int i = 31; i >= 0; --i) {
+        unsigned int v = t[i];
+        v = (unsigned int)((uint64_t)v * (uint64_t)avg / (uint64_t)target_spacing);
+        if (v > 255U) v = 255U;
+        t[i] = (unsigned char)v;
+    }
+    return compact_from_target(t);
+}
+
+// --- Fixed LWMA with proper 256-bit arithmetic ---
+static uint32_t lwma_next_bits_fixed(const std::vector<std::pair<int64_t, uint32_t>>& last,
+                                     int64_t target_spacing, uint32_t min_bits) {
     if (last.size() < 2) return min_bits;
 
     size_t window = (last.size() < 90) ? last.size() : 90;
@@ -65,17 +168,45 @@ uint32_t lwma_next_bits(const std::vector<std::pair<int64_t, uint32_t>>& last,
 
     int64_t avg = sum / (int64_t)(window - 1);
 
-    // Scale target by avg/target_spacing in big-endian space
+    // Clamp avg to reasonable bounds to prevent extreme adjustments
+    // Min: 1/4 of target (4x difficulty increase max per epoch)
+    // Max: 4x of target (4x difficulty decrease max per epoch)
+    int64_t min_avg = target_spacing / 4;
+    int64_t max_avg = target_spacing * 4;
+    if (avg < min_avg) avg = min_avg;
+    if (avg > max_avg) avg = max_avg;
+
+    // Scale target by avg/target_spacing using proper 256-bit arithmetic
     unsigned char t[32];
     target_from_compact(last.back().second, t);
 
-    for (int i = 31; i >= 0; --i) {
-        unsigned int v = t[i];
-        v = (unsigned int)((uint64_t)v * (uint64_t)avg / (uint64_t)target_spacing);
-        if (v > 255U) v = 255U;
-        t[i] = (unsigned char)v;
+    // Use 256-bit multiplication and division for accurate scaling
+    scale_target_256(t, (uint64_t)avg, (uint64_t)target_spacing);
+
+    // Safety: if result is all zeros (would happen with extreme difficulty),
+    // return the previous bits to avoid breaking consensus
+    if (is_target_zero(t)) {
+        log_warn("lwma_next_bits_fixed: target underflow, keeping previous bits");
+        return last.back().second;
     }
-    return compact_from_target(t);
+
+    uint32_t result = compact_from_target(t);
+
+    // Safety: if compact conversion failed, return previous bits
+    if (result == 0) {
+        log_warn("lwma_next_bits_fixed: compact conversion failed, keeping previous bits");
+        return last.back().second;
+    }
+
+    return result;
+}
+
+// --- Public API: automatically selects legacy or fixed based on height ---
+uint32_t lwma_next_bits(const std::vector<std::pair<int64_t, uint32_t>>& last,
+                        int64_t target_spacing, uint32_t min_bits) {
+    // For backwards compatibility, use fixed version by default
+    // (callers that care about height should use epoch_next_bits instead)
+    return lwma_next_bits_fixed(last, target_spacing, min_bits);
 }
 
 // --- Epoch retarget: freeze inside epoch; adjust only at boundary ---
@@ -95,12 +226,22 @@ uint32_t epoch_next_bits(const std::vector<std::pair<int64_t, uint32_t>>& last,
         return last.empty() ? min_bits : last.back().second;
     }
 
+    // Select algorithm based on activation height
+    // Blocks before activation use legacy algorithm for consensus compatibility
+    // Blocks at/after activation use fixed 256-bit arithmetic
+    bool use_fixed = (next_height >= DIFFICULTY_FIX_ACTIVATION_HEIGHT);
+
+    std::vector<std::pair<int64_t, uint32_t>> window_data;
     if (last.size() > interval) {
-        // Use only the last `interval` headers to determine the new target
-        std::vector<std::pair<int64_t, uint32_t>> tail(last.end() - interval, last.end());
-        return lwma_next_bits(tail, target_spacing, min_bits);
+        window_data.assign(last.end() - interval, last.end());
     } else {
-        return lwma_next_bits(last, target_spacing, min_bits);
+        window_data = last;
+    }
+
+    if (use_fixed) {
+        return lwma_next_bits_fixed(window_data, target_spacing, min_bits);
+    } else {
+        return lwma_next_bits_legacy(window_data, target_spacing, min_bits);
     }
 }
 
