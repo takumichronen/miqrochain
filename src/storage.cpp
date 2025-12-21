@@ -318,4 +318,98 @@ bool miq::Storage::read_state(std::vector<uint8_t>& out) const {
     return (bool)f.read(reinterpret_cast<char*>(out.data()), sz);
 }
 
+// RECOVERY: Remove a block hash from the index so it can be re-requested
+// This is used when a block is found to be corrupted
+bool miq::Storage::invalidate_block(const std::vector<uint8_t>& hash) {
+    std::string hexh = miq::to_hex(hash);
+    auto it = hash_to_index_.find(hexh);
+    if (it == hash_to_index_.end()) {
+        log_warn("Storage::invalidate_block: hash " + hexh + " not found in index");
+        return false;
+    }
+
+    uint32_t index = it->second;
+    log_warn("Storage::invalidate_block: removing block at index " + std::to_string(index) +
+             " (hash " + hexh + ") from index - will be re-requested from peers");
+
+    // Remove from in-memory index
+    hash_to_index_.erase(it);
+
+    // Rewrite hash.map file without this block
+    std::ofstream hf(path_hashmap_, std::ios::binary | std::ios::trunc);
+    if (!hf) {
+        log_warn("Storage::invalidate_block: failed to rewrite hash.map");
+        return false;
+    }
+
+    for (const auto& kv : hash_to_index_) {
+        // Key format: [uint32_t key_size][key_data][uint32_t index]
+        uint32_t ksz = (uint32_t)kv.first.size();
+        hf.write((const char*)&ksz, sizeof(ksz));
+        hf.write(kv.first.c_str(), ksz);
+        hf.write((const char*)&kv.second, sizeof(kv.second));
+    }
+    hf.close();
+
+    log_info("Storage::invalidate_block: block " + hexh + " removed from index, will be re-synced");
+    return true;
+}
+
+// DIAGNOSTICS: Check if a block at a given index can be read and deserialized
+bool miq::Storage::validate_block_at_index(size_t index) const {
+    if (index >= offsets_.size()) {
+        log_error("Storage::validate_block_at_index(" + std::to_string(index) +
+                 "): index out of range (max " + std::to_string(offsets_.size()) + ")");
+        return false;
+    }
+
+    std::ifstream f(path_blocks_, std::ios::binary);
+    if (!f) {
+        log_error("Storage::validate_block_at_index: cannot open blocks.dat");
+        return false;
+    }
+
+    f.seekg((std::streamoff)offsets_[index], std::ios::beg);
+    uint32_t sz = 0;
+    if (!f.read((char*)&sz, sizeof(sz))) {
+        log_error("Storage::validate_block_at_index(" + std::to_string(index) +
+                 "): cannot read size field at offset " + std::to_string(offsets_[index]));
+        return false;
+    }
+
+    static constexpr uint32_t STORAGE_MAX_BLOCK_SIZE = 32 * 1024 * 1024;
+    if (sz == 0 || sz > STORAGE_MAX_BLOCK_SIZE) {
+        log_error("Storage::validate_block_at_index(" + std::to_string(index) +
+                 "): invalid block size " + std::to_string(sz) + " bytes");
+        return false;
+    }
+
+    std::vector<uint8_t> raw(sz);
+    if (!f.read((char*)raw.data(), sz)) {
+        log_error("Storage::validate_block_at_index(" + std::to_string(index) +
+                 "): cannot read " + std::to_string(sz) + " bytes of block data");
+        return false;
+    }
+
+    // Try to deserialize
+    miq::Block blk;
+    if (!miq::deser_block(raw, blk)) {
+        log_error("Storage::validate_block_at_index(" + std::to_string(index) +
+                 "): deser_block failed - block data is corrupted");
+        return false;
+    }
+
+    // Validate block has at least one transaction (coinbase)
+    if (blk.txs.empty()) {
+        log_error("Storage::validate_block_at_index(" + std::to_string(index) +
+                 "): block has no transactions");
+        return false;
+    }
+
+    log_info("Storage::validate_block_at_index(" + std::to_string(index) +
+             "): block is valid (" + std::to_string(blk.txs.size()) + " txs, " +
+             std::to_string(sz) + " bytes)");
+    return true;
+}
+
 } // namespace miq

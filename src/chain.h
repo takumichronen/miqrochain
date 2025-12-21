@@ -136,6 +136,14 @@ public:
     // Recovers from corrupted/incomplete UTXO sets that cause "missing utxo" errors
     bool rebuild_utxo_from_blocks();
 
+    // DIAGNOSTICS: Validate all stored blocks and report any corruption
+    // Returns number of corrupted blocks found (0 = all valid)
+    size_t validate_stored_blocks(bool fix_corrupted = false);
+
+    // RECOVERY: Rewind chain tip to recover from corruption
+    // This is used when a block is found to be corrupted and needs to be re-synced
+    bool rewind_tip_to_height(uint64_t target_height, std::string& err);
+
 #if MIQ_HAVE_GCS_FILTERS
     // === Compact filter RPC helpers for the P2P server ===
     // Returns rolling filter headers (BIP158-style) for [start, start+count).

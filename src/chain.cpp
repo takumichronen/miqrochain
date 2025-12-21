@@ -1766,6 +1766,88 @@ bool Chain::rebuild_utxo_from_blocks() {
     return true;
 }
 
+// DIAGNOSTICS: Validate all stored blocks and report any corruption
+size_t Chain::validate_stored_blocks(bool fix_corrupted) {
+    MIQ_CHAIN_GUARD();
+
+    size_t corrupted_count = 0;
+    size_t total = storage_.count();
+
+    log_info("Validating " + std::to_string(total) + " stored blocks...");
+
+    for (size_t i = 0; i < total; ++i) {
+        if (!storage_.validate_block_at_index(i)) {
+            corrupted_count++;
+            log_error("Block at storage index " + std::to_string(i) + " is CORRUPTED");
+
+            if (fix_corrupted) {
+                // Try to get the block hash to invalidate it
+                std::vector<uint8_t> raw;
+                if (storage_.read_block_by_index(i, raw) && raw.size() >= 88) {
+                    // Extract block hash from raw data (first 88 bytes is header)
+                    Block blk;
+                    if (deser_block(raw, blk)) {
+                        auto hash = blk.block_hash();
+                        storage_.invalidate_block(hash);
+                        log_warn("Invalidated corrupted block - will be re-requested from peers");
+                    }
+                }
+            }
+        }
+
+        if ((i + 1) % 1000 == 0) {
+            log_info("Validated " + std::to_string(i + 1) + "/" + std::to_string(total) + " blocks");
+        }
+    }
+
+    if (corrupted_count == 0) {
+        log_info("All " + std::to_string(total) + " blocks validated successfully");
+    } else {
+        log_error("Found " + std::to_string(corrupted_count) + " corrupted blocks out of " +
+                  std::to_string(total));
+    }
+
+    return corrupted_count;
+}
+
+// RECOVERY: Rewind chain tip to recover from corruption
+bool Chain::rewind_tip_to_height(uint64_t target_height, std::string& err) {
+    MIQ_CHAIN_GUARD();
+
+    if (target_height >= tip_.height) {
+        err = "Target height " + std::to_string(target_height) +
+              " is not less than current tip " + std::to_string(tip_.height);
+        return false;
+    }
+
+    log_warn("Rewinding chain from height " + std::to_string(tip_.height) +
+             " to height " + std::to_string(target_height));
+
+    // Use disconnect_tip_once repeatedly until we reach target height
+    while (tip_.height > target_height) {
+        std::string disconnect_err;
+        if (!disconnect_tip_once(disconnect_err)) {
+            err = "Failed to disconnect tip at height " + std::to_string(tip_.height) +
+                  ": " + disconnect_err;
+            log_error(err);
+            return false;
+        }
+        log_info("Disconnected block at height " + std::to_string(tip_.height + 1) +
+                 ", new tip height: " + std::to_string(tip_.height));
+    }
+
+    // Save state after rewind
+    if (!save_state()) {
+        err = "Failed to save state after rewind";
+        log_error(err);
+        return false;
+    }
+
+    log_info("Chain rewound to height " + std::to_string(target_height) +
+             " - missing blocks will be re-synced from peers");
+    return true;
+}
+
 bool Chain::load_state(){
     MIQ_CHAIN_GUARD();
     std::vector<uint8_t> b;
@@ -2848,14 +2930,24 @@ bool Chain::get_block_by_index(size_t idx, Block& out) const{
     MIQ_CHAIN_GUARD();
 
     // Quick bounds check
-    if (idx > tip_.height) return false;
+    if (idx > tip_.height) {
+        log_error("get_block_by_index(" + std::to_string(idx) + ") FAILED: idx > tip_.height (" + std::to_string(tip_.height) + ")");
+        return false;
+    }
 
     // Special case: if no headers exist, fall back to storage index (pre-IBD)
     // This maintains backwards compatibility for genesis initialization
     if (header_index_.empty()) {
         std::vector<uint8_t> raw;
-        if (!storage_.read_block_by_index(idx, raw)) return false;
-        return deser_block(raw, out);
+        if (!storage_.read_block_by_index(idx, raw)) {
+            log_error("get_block_by_index(" + std::to_string(idx) + ") FAILED: header_index_ empty, storage read failed");
+            return false;
+        }
+        if (!deser_block(raw, out)) {
+            log_error("get_block_by_index(" + std::to_string(idx) + ") FAILED: header_index_ empty, deser_block failed (raw size=" + std::to_string(raw.size()) + ")");
+            return false;
+        }
+        return true;
     }
 
     // Walk back from tip to find the block hash at height idx
@@ -2871,9 +2963,17 @@ bool Chain::get_block_by_index(size_t idx, Block& out) const{
             // This handles cases where header_index_ is incomplete (node restart, etc.)
             // IMPORTANT: After reorgs, storage may have stale blocks, but if headers
             // are incomplete we have no choice - let validation catch any issues
+            log_warn("get_block_by_index(" + std::to_string(idx) + "): header_index_ incomplete at height " + std::to_string(cur_height) + ", falling back to storage");
             std::vector<uint8_t> raw;
-            if (!storage_.read_block_by_index(idx, raw)) return false;
-            return deser_block(raw, out);
+            if (!storage_.read_block_by_index(idx, raw)) {
+                log_error("get_block_by_index(" + std::to_string(idx) + ") FAILED: storage read failed (fallback path)");
+                return false;
+            }
+            if (!deser_block(raw, out)) {
+                log_error("get_block_by_index(" + std::to_string(idx) + ") FAILED: deser_block failed (fallback path, raw size=" + std::to_string(raw.size()) + ")");
+                return false;
+            }
+            return true;
         }
         cur_hash = it->second.prev;
         cur_height--;
@@ -2882,13 +2982,21 @@ bool Chain::get_block_by_index(size_t idx, Block& out) const{
     // Now cur_hash is the hash of block at height idx
     // Verify height matches (sanity check)
     if (cur_height != idx) {
+        log_error("get_block_by_index(" + std::to_string(idx) + ") FAILED: height mismatch after walk (cur_height=" + std::to_string(cur_height) + ")");
         return false;
     }
 
     // Get block by hash
     std::vector<uint8_t> raw;
-    if (!storage_.read_block_by_hash(cur_hash, raw)) return false;
-    return deser_block(raw, out);
+    if (!storage_.read_block_by_hash(cur_hash, raw)) {
+        log_error("get_block_by_index(" + std::to_string(idx) + ") FAILED: storage read_block_by_hash failed for hash " + to_hex(cur_hash));
+        return false;
+    }
+    if (!deser_block(raw, out)) {
+        log_error("get_block_by_index(" + std::to_string(idx) + ") FAILED: deser_block failed (hash path, raw size=" + std::to_string(raw.size()) + ")");
+        return false;
+    }
+    return true;
 }
 
 bool Chain::get_block_by_hash(const std::vector<uint8_t>& h, Block& out) const{
