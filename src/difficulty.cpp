@@ -9,6 +9,26 @@
 
 namespace miq {
 
+// =============================================================================
+// DIFFICULTY FIX ACTIVATION HEIGHT
+// =============================================================================
+// The original LWMA algorithm had a bug that prevented difficulty from decreasing
+// (target couldn't increase when blocks were slow). This was fixed with proper
+// 256-bit arithmetic, but changing the algorithm would invalidate existing blocks.
+//
+// Solution: Use legacy algorithm for blocks BELOW this height (preserves consensus),
+// use fixed algorithm for blocks AT OR ABOVE this height (fixes future difficulty).
+//
+// Your chain history: Diff 1.0 → 25.5 → 255.5 → stuck
+// Current tip: ~7884 (epoch 3 boundary)
+// Next epoch: 10512 (epoch 4 boundary)
+//
+// Set this to the NEXT EPOCH BOUNDARY after your current tip to ensure:
+// - All existing blocks validate with legacy algorithm
+// - All future epoch calculations use the fixed algorithm
+// =============================================================================
+static constexpr uint64_t DIFFICULTY_FIX_ACTIVATION_HEIGHT = 10512;
+
 // Convert big-endian 32-byte target -> compact "bits"
 static inline uint32_t compact_from_target(const unsigned char* t) {
     int i = 0;
@@ -95,9 +115,54 @@ static void target_multiply_ratio(unsigned char t[32], uint64_t num, uint64_t de
     }
 }
 
-// --- LWMA with FIXED 256-bit arithmetic ---
-uint32_t lwma_next_bits(const std::vector<std::pair<int64_t, uint32_t>>& last,
-                        int64_t target_spacing, uint32_t min_bits) {
+// =============================================================================
+// LEGACY LWMA Algorithm (for blocks < DIFFICULTY_FIX_ACTIVATION_HEIGHT)
+// =============================================================================
+// This is the original buggy algorithm that was used for blocks 0-10511.
+// It has a bug where each byte is scaled individually and capped at 255,
+// preventing the target from increasing when blocks are slow.
+// We MUST keep this for consensus compatibility with existing blocks.
+// =============================================================================
+static uint32_t lwma_next_bits_legacy(const std::vector<std::pair<int64_t, uint32_t>>& last,
+                                       int64_t target_spacing, uint32_t min_bits) {
+    if (last.size() < 2) return min_bits;
+
+    size_t window = (last.size() < 90) ? last.size() : 90;
+    int64_t sum = 0;
+
+    for (size_t i = last.size() - window + 1; i < last.size(); ++i) {
+        int64_t dt = last[i].first - last[i - 1].first;
+        if (dt < 1) dt = 1;
+        int64_t cap = target_spacing * 10;
+        if (dt > cap) dt = cap;
+        sum += dt;
+    }
+
+    int64_t avg = sum / (int64_t)(window - 1);
+
+    unsigned char t[32];
+    target_from_compact(last.back().second, t);
+
+    // LEGACY: Buggy byte-by-byte scaling with cap at 255 (no carry propagation)
+    // This is WRONG but must be kept for consensus with existing blocks
+    for (int i = 31; i >= 0; --i) {
+        unsigned int v = t[i];
+        v = (unsigned int)((uint64_t)v * (uint64_t)avg / (uint64_t)target_spacing);
+        if (v > 255U) v = 255U;  // BUG: caps at 255, no carry!
+        t[i] = (unsigned char)v;
+    }
+
+    return compact_from_target(t);
+}
+
+// =============================================================================
+// FIXED LWMA Algorithm (for blocks >= DIFFICULTY_FIX_ACTIVATION_HEIGHT)
+// =============================================================================
+// Uses proper 256-bit arithmetic with carry propagation.
+// This correctly handles both increasing AND decreasing difficulty.
+// =============================================================================
+static uint32_t lwma_next_bits_fixed(const std::vector<std::pair<int64_t, uint32_t>>& last,
+                                      int64_t target_spacing, uint32_t min_bits) {
     if (last.size() < 2) return min_bits;
 
     size_t window = (last.size() < 90) ? last.size() : 90;
@@ -121,14 +186,13 @@ uint32_t lwma_next_bits(const std::vector<std::pair<int64_t, uint32_t>>& last,
     // DEBUG: Log difficulty calculation details
     {
         std::ostringstream oss;
-        oss << "LWMA: window=" << window << " sum=" << sum << " avg=" << avg
+        oss << "LWMA_FIXED: window=" << window << " sum=" << sum << " avg=" << avg
             << " target_spacing=" << target_spacing << " ratio=" << (double)avg/(double)target_spacing
             << " prev_bits=0x" << std::hex << last.back().second;
         log_info(oss.str());
     }
 
-    // FIXED: Use proper 256-bit arithmetic instead of buggy byte-by-byte scaling
-    // new_target = old_target * avg / target_spacing
+    // FIXED: Use proper 256-bit arithmetic
     target_multiply_ratio(t, (uint64_t)avg, (uint64_t)target_spacing);
 
     // Ensure target doesn't exceed max (min difficulty)
@@ -138,30 +202,36 @@ uint32_t lwma_next_bits(const std::vector<std::pair<int64_t, uint32_t>>& last,
     // Compare: if t > max_target, cap at max_target
     for (int i = 0; i < 32; ++i) {
         if (t[i] > max_target[i]) {
-            // Target exceeded max, use min_bits
             return min_bits;
         } else if (t[i] < max_target[i]) {
-            break;  // t < max_target, we're fine
+            break;
         }
     }
 
-    // Ensure target isn't zero (would be impossible difficulty)
+    // Ensure target isn't zero
     bool is_zero = true;
     for (int i = 0; i < 32; ++i) {
         if (t[i] != 0) { is_zero = false; break; }
     }
-    if (is_zero) t[31] = 1;  // Minimum non-zero target
+    if (is_zero) t[31] = 1;
 
     uint32_t result = compact_from_target(t);
 
     // DEBUG: Log result
     {
         std::ostringstream oss;
-        oss << "LWMA: result_bits=0x" << std::hex << result;
+        oss << "LWMA_FIXED: result_bits=0x" << std::hex << result;
         log_info(oss.str());
     }
 
     return result;
+}
+
+// --- Public LWMA function (delegates based on use_fixed flag) ---
+uint32_t lwma_next_bits(const std::vector<std::pair<int64_t, uint32_t>>& last,
+                        int64_t target_spacing, uint32_t min_bits) {
+    // Default to legacy for backward compatibility when called without height context
+    return lwma_next_bits_legacy(last, target_spacing, min_bits);
 }
 
 // --- Epoch retarget: freeze inside epoch; adjust only at boundary ---
@@ -170,13 +240,17 @@ uint32_t epoch_next_bits(const std::vector<std::pair<int64_t, uint32_t>>& last,
                          uint32_t min_bits,
                          uint64_t next_height,
                          size_t interval) {
+    // Determine which algorithm to use based on activation height
+    const bool use_fixed = (next_height >= DIFFICULTY_FIX_ACTIVATION_HEIGHT);
+
     // DEBUG: Log epoch_next_bits call
     {
         std::ostringstream oss;
         oss << "epoch_next_bits: next_height=" << next_height
             << " interval=" << interval
             << " last.size()=" << last.size()
-            << " at_boundary=" << ((next_height % interval) == 0 ? "YES" : "no");
+            << " at_boundary=" << ((next_height % interval) == 0 ? "YES" : "no")
+            << " algorithm=" << (use_fixed ? "FIXED" : "LEGACY");
         log_info(oss.str());
     }
 
@@ -191,14 +265,17 @@ uint32_t epoch_next_bits(const std::vector<std::pair<int64_t, uint32_t>>& last,
         return last.empty() ? min_bits : last.back().second;
     }
 
+    // Select algorithm based on activation height
+    auto compute_bits = use_fixed ? lwma_next_bits_fixed : lwma_next_bits_legacy;
+
     if (last.size() > interval) {
         // Use only the last `interval` headers to determine the new target
         log_info("epoch_next_bits: using tail of " + std::to_string(interval) + " headers");
         std::vector<std::pair<int64_t, uint32_t>> tail(last.end() - interval, last.end());
-        return lwma_next_bits(tail, target_spacing, min_bits);
+        return compute_bits(tail, target_spacing, min_bits);
     } else {
         log_info("epoch_next_bits: using all " + std::to_string(last.size()) + " headers");
-        return lwma_next_bits(last, target_spacing, min_bits);
+        return compute_bits(last, target_spacing, min_bits);
     }
 }
 
