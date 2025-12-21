@@ -48,7 +48,54 @@ static inline void target_from_compact(uint32_t bits, unsigned char* out) {
     }
 }
 
-// --- LWMA (kept; window implied by size of `last`) ---
+// =============================================================================
+// FIXED: Proper 256-bit multiplication with carry propagation
+// =============================================================================
+// The original algorithm had a critical bug: each byte was scaled individually
+// and capped at 255, with NO carry propagation. This meant:
+// - ratio < 1 (fast blocks): target decreases correctly
+// - ratio > 1 (slow blocks): target CAN'T increase (bytes cap at 0xFF)
+//
+// This fix uses proper big-integer arithmetic:
+// 1. Multiply entire 256-bit target by numerator
+// 2. Divide by denominator with proper long division
+// 3. Handle carry/borrow correctly across all bytes
+// =============================================================================
+static void target_multiply_ratio(unsigned char t[32], uint64_t num, uint64_t denom) {
+    if (denom == 0) return;
+    if (num == denom) return;  // ratio = 1, no change
+
+    // Step 1: Multiply target by numerator (with carry propagation)
+    // Process LSB to MSB for correct carry handling
+    uint64_t carry = 0;
+    for (int i = 31; i >= 0; --i) {
+        uint64_t val = (uint64_t)t[i] * num + carry;
+        t[i] = (unsigned char)(val % 256);
+        carry = val / 256;
+    }
+
+    // Handle overflow (carry left over after MSB)
+    // If there's overflow, we need to shift right and adjust
+    if (carry > 0) {
+        // Overflow occurred - the target is larger than 256 bits
+        // Shift right by the number of overflow bytes and fill MSB
+        // For simplicity, if we overflow significantly, cap at max target
+        // This is safe because max target = easiest difficulty
+        for (int i = 0; i < 32; ++i) t[i] = 0xFF;
+        return;
+    }
+
+    // Step 2: Divide target by denominator (with proper long division)
+    // Process MSB to LSB for correct remainder handling
+    uint64_t remainder = 0;
+    for (int i = 0; i < 32; ++i) {
+        uint64_t val = remainder * 256 + t[i];
+        t[i] = (unsigned char)(val / denom);
+        remainder = val % denom;
+    }
+}
+
+// --- LWMA with FIXED 256-bit arithmetic ---
 uint32_t lwma_next_bits(const std::vector<std::pair<int64_t, uint32_t>>& last,
                         int64_t target_spacing, uint32_t min_bits) {
     if (last.size() < 2) return min_bits;
@@ -67,7 +114,7 @@ uint32_t lwma_next_bits(const std::vector<std::pair<int64_t, uint32_t>>& last,
 
     int64_t avg = sum / (int64_t)(window - 1);
 
-    // Scale target by avg/target_spacing in big-endian space
+    // Get current target
     unsigned char t[32];
     target_from_compact(last.back().second, t);
 
@@ -80,12 +127,30 @@ uint32_t lwma_next_bits(const std::vector<std::pair<int64_t, uint32_t>>& last,
         log_info(oss.str());
     }
 
-    for (int i = 31; i >= 0; --i) {
-        unsigned int v = t[i];
-        v = (unsigned int)((uint64_t)v * (uint64_t)avg / (uint64_t)target_spacing);
-        if (v > 255U) v = 255U;
-        t[i] = (unsigned char)v;
+    // FIXED: Use proper 256-bit arithmetic instead of buggy byte-by-byte scaling
+    // new_target = old_target * avg / target_spacing
+    target_multiply_ratio(t, (uint64_t)avg, (uint64_t)target_spacing);
+
+    // Ensure target doesn't exceed max (min difficulty)
+    unsigned char max_target[32];
+    target_from_compact(min_bits, max_target);
+
+    // Compare: if t > max_target, cap at max_target
+    for (int i = 0; i < 32; ++i) {
+        if (t[i] > max_target[i]) {
+            // Target exceeded max, use min_bits
+            return min_bits;
+        } else if (t[i] < max_target[i]) {
+            break;  // t < max_target, we're fine
+        }
     }
+
+    // Ensure target isn't zero (would be impossible difficulty)
+    bool is_zero = true;
+    for (int i = 0; i < 32; ++i) {
+        if (t[i] != 0) { is_zero = false; break; }
+    }
+    if (is_zero) t[31] = 1;  // Minimum non-zero target
 
     uint32_t result = compact_from_target(t);
 
